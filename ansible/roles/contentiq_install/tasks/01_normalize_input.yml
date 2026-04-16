@@ -1,0 +1,242 @@
+---
+- name: Load backend secret values from file
+  ansible.builtin.include_vars:
+    file: "{{ contentiq_backend_secret_file }}"
+    name: contentiq_install_backend_secret_from_file
+  when: contentiq_backend_secret_file | length > 0
+  no_log: true
+
+- name: Load RAG secret values from file
+  ansible.builtin.include_vars:
+    file: "{{ contentiq_rag_secret_file }}"
+    name: contentiq_install_rag_secret_from_file
+  when: contentiq_rag_secret_file | length > 0
+  no_log: true
+
+- name: Normalize backend secret loaded from file (Kubernetes Secret manifest or flat map)
+  ansible.builtin.set_fact:
+    contentiq_install_backend_secret_from_file_effective: >-
+      {{
+        (contentiq_install_backend_secret_from_file['stringData'] | default({}))
+        if (
+          contentiq_install_backend_secret_from_file is mapping
+          and ('stringData' in contentiq_install_backend_secret_from_file)
+          and (contentiq_install_backend_secret_from_file['stringData'] | default({}) is mapping)
+        )
+        else (contentiq_install_backend_secret_from_file | default({}))
+      }}
+  when:
+    - contentiq_backend_secret_file | length > 0
+    - contentiq_install_backend_secret_from_file is defined
+  no_log: true
+
+- name: Normalize RAG secret loaded from file (Kubernetes Secret manifest or flat map)
+  ansible.builtin.set_fact:
+    contentiq_install_rag_secret_from_file_effective: >-
+      {{
+        (contentiq_install_rag_secret_from_file['stringData'] | default({}))
+        if (
+          contentiq_install_rag_secret_from_file is mapping
+          and ('stringData' in contentiq_install_rag_secret_from_file)
+          and (contentiq_install_rag_secret_from_file['stringData'] | default({}) is mapping)
+        )
+        else (contentiq_install_rag_secret_from_file | default({}))
+      }}
+  when:
+    - contentiq_rag_secret_file | length > 0
+    - contentiq_install_rag_secret_from_file is defined
+  no_log: true
+
+- name: Resolve registry username from command
+  ansible.builtin.shell: "{{ contentiq_registry.username_command }}"
+  args:
+    executable: /bin/bash
+  register: contentiq_install_registry_username_cmd
+  when:
+    - contentiq_registry.username | length == 0
+    - contentiq_registry.username_command | length > 0
+  changed_when: false
+  no_log: true
+
+- name: Resolve registry password from command
+  ansible.builtin.shell: "{{ contentiq_registry.password_command }}"
+  args:
+    executable: /bin/bash
+  register: contentiq_install_registry_password_cmd
+  when:
+    - contentiq_registry.password | length == 0
+    - contentiq_registry.password_command | length > 0
+  changed_when: false
+  no_log: true
+
+- name: Resolve registry email from command
+  ansible.builtin.shell: "{{ contentiq_registry.email_command }}"
+  args:
+    executable: /bin/bash
+  register: contentiq_install_registry_email_cmd
+  when:
+    - contentiq_registry.email | length == 0
+    - contentiq_registry.email_command | length > 0
+  changed_when: false
+  no_log: true
+
+- name: Resolve backend secret values from command
+  ansible.builtin.shell: "{{ contentiq_backend_secret_command }}"
+  args:
+    executable: /bin/bash
+  register: contentiq_install_backend_secret_cmd
+  when: contentiq_backend_secret_command | length > 0
+  changed_when: false
+  no_log: true
+
+- name: Resolve RAG secret values from command
+  ansible.builtin.shell: "{{ contentiq_rag_secret_command }}"
+  args:
+    executable: /bin/bash
+  register: contentiq_install_rag_secret_cmd
+  when: contentiq_rag_secret_command | length > 0
+  changed_when: false
+  no_log: true
+
+- name: Build effective registry credentials
+  ansible.builtin.set_fact:
+    contentiq_install_registry:
+      server: "{{ contentiq_registry.server }}"
+      username: >-
+        {{
+          contentiq_registry.username
+          if contentiq_registry.username | length > 0
+          else (contentiq_install_registry_username_cmd.stdout | default('') | trim)
+        }}
+      password: >-
+        {{
+          contentiq_registry.password
+          if contentiq_registry.password | length > 0
+          else (contentiq_install_registry_password_cmd.stdout | default('') | trim)
+        }}
+      email: >-
+        {{
+          contentiq_registry.email
+          if contentiq_registry.email | length > 0
+          else ((contentiq_install_registry_email_cmd.stdout | default('') | trim) or 'noreply@example.com')
+        }}
+      internal_registry: "{{ contentiq_registry.internal_registry }}"
+  no_log: true
+
+- name: Build backend secret from all configured sources
+  ansible.builtin.set_fact:
+    contentiq_install_backend_secret_resolved: >-
+      {{
+        (
+          contentiq_install_backend_secret_from_file_effective
+          | default(contentiq_install_backend_secret_from_file | default({}))
+        )
+        | combine(
+            (contentiq_install_backend_secret_cmd.stdout | default('{}', true) | from_yaml | default({}, true)),
+            recursive=True
+          )
+        | combine(
+            (
+              contentiq_backend_secret
+              if contentiq_backend_secret is mapping
+              else (contentiq_backend_secret | default('{}', true) | from_yaml | default({}, true))
+            ),
+            recursive=True
+          )
+      }}
+  no_log: true
+
+- name: Build RAG secret from all configured sources
+  ansible.builtin.set_fact:
+    contentiq_install_rag_secret_resolved: >-
+      {{
+        (
+          contentiq_install_rag_secret_from_file_effective
+          | default(contentiq_install_rag_secret_from_file | default({}))
+        )
+        | combine(
+            (contentiq_install_rag_secret_cmd.stdout | default('{}', true) | from_yaml | default({}, true)),
+            recursive=True
+          )
+        | combine(
+            (
+              contentiq_rag_secret
+              if contentiq_rag_secret is mapping
+              else (contentiq_rag_secret | default('{}', true) | from_yaml | default({}, true))
+            ),
+            recursive=True
+          )
+      }}
+  no_log: true
+
+- name: Compute initial route-derived secret values from configured hostnames
+  ansible.builtin.set_fact:
+    contentiq_install_frontend_url: >-
+      {{
+        'https://' ~ contentiq_routes.frontend_hostname
+        if contentiq_routes.frontend_hostname | length > 0
+        else ''
+      }}
+    contentiq_install_backend_url: >-
+      {{
+        'https://' ~ contentiq_routes.backend_hostname
+        if contentiq_routes.backend_hostname | length > 0
+        else ''
+      }}
+    contentiq_install_session_cookie_domain: >-
+      {{
+        contentiq_routes.frontend_hostname | regex_replace('^[^.]+', '')
+        if contentiq_routes.frontend_hostname | length > 0
+        else ''
+      }}
+  no_log: true
+
+- name: Apply configured route defaults to backend secret
+  ansible.builtin.set_fact:
+    contentiq_install_backend_secret_resolved: >-
+      {{
+        contentiq_install_backend_secret_resolved
+        | combine(
+            (
+              {
+                'FRONTEND_URL': contentiq_install_frontend_url,
+                'CORS_ALLOWED_ORIGINS': contentiq_install_frontend_url,
+                'SESSION_COOKIE_DOMAIN': contentiq_install_session_cookie_domain
+              }
+              if (
+                contentiq_auto_compute_route_settings | bool
+                and contentiq_install_frontend_url | length > 0
+              )
+              else {}
+            ),
+            recursive=True
+          )
+        | combine(
+            (
+              {
+                'MICROSOFT_REDIRECT_URI': contentiq_install_backend_url ~ '/api/connections/microsoft/auth/microsoft/callback'
+              }
+              if (
+                contentiq_auto_compute_route_settings | bool
+                and contentiq_install_backend_url | length > 0
+              )
+              else {}
+            ),
+            recursive=True
+          )
+        | combine(
+            (
+              {
+                'GOOGLE_REDIRECT_URI': contentiq_install_backend_url ~ '/api/connections/googledrive/auth/google/callback',
+                'BOX_REDIRECT_URI': contentiq_install_backend_url ~ '/api/connections/box/auth/box/callback'
+              }
+              if (
+                contentiq_auto_compute_oauth_redirects | bool
+                and contentiq_install_backend_url | length > 0
+              )
+              else {}
+            ),
+            recursive=True
+          )
+      }}
+  no_log: true

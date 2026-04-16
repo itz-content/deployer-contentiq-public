@@ -1,0 +1,114 @@
+apiVersion: contentiq.symplistic.ai/v1alpha1
+kind: ContentIQ
+metadata:
+  name: contentiq-instance
+  namespace: contentiq
+spec:
+  # Namespace where application components will run
+  namespace: contentiq
+
+  # REQUIRED: Application images (set to your registry, tags are not auto-set by the operator)
+  images:
+    frontend: "docker.io/symplisticai/contentiq-frontend:1.2.31"        # REPLACE with your mirrored image
+    backend: "docker.io/symplisticai/contentiq-backend:1.2.31"         # REPLACE with your mirrored image
+    rag: "docker.io/symplisticai/personalization-rag:1.2.31"            # REPLACE with your mirrored image
+    redis: "docker.io/library/redis:7-alpine"                         # Optional: set for air-gap (default is operator-managed) 
+
+  # Optional: image pull secrets applied to all components (frontend/backend/rag)
+  # imagePullSecrets:
+  #   - name: dockerhub-pull
+
+  # Component replicas
+  backendReplicas: 1
+  frontendReplicas: 1
+  ragReplicas: 1
+
+  # Routes (operator will create if enabled)
+  routes:
+    frontend:
+      enabled: true
+      # REQUIRED: Set custom hostname to avoid auto-generated format (contentiq-frontend-contentiq.<domain>)
+      # Option 1: Use OpenShift cluster domain (recommended for most cases)
+      # Get your cluster domain: oc get ingress.config/cluster -o jsonpath='{.spec.domain}'
+      # Then use: <subdomain>.apps.<your-cluster-domain>
+      # CRC / local OpenShift: default apps domain is often apps-crc.testing
+      # Replaced by deploy.yml from ingress domain + contentiq_route_frontend_label (see __CONTENTIQ_ROUTE_*__)
+      hostname: "__CONTENTIQ_ROUTE_FRONTEND_HOST__"
+      # Option 2: Use fully qualified domain (requires DNS configuration)
+      # hostname: "contentiq.symplistic.ai"  # Requires DNS CNAME pointing to OpenShift router
+    backend:
+      enabled: true
+      hostname: "__CONTENTIQ_ROUTE_BACKEND_HOST__"
+      cors:
+        enabled: true
+        # allowedOrigins will be auto-populated from frontend route if not specified
+        # or can be explicitly specified:
+        # allowedOrigins:
+        #   - "https://contentiq.symplistic.ai.apps.example.com"
+
+  # Resource limits (optional overrides - defaults shown)
+  backendResources:
+    requests:
+      cpu: "1"
+      memory: "4Gi"
+    limits:
+      cpu: "1"
+      memory: "40Gi"
+
+  frontendResources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+
+  ragResources:
+    requests:
+      cpu: "500m"
+      memory: "2Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+
+  # Redis: operator-managed by default. The operator injects REDIS_URL into backend and can use external Redis.
+  # If you set redis.password, the operator updates the managed Redis secret and rolls Redis and backend pods to apply it.
+  # redis:
+  #   # mode: "ephemeral"          # ephemeral (default), persistent, or external
+  #   # image: "redis:7-alpine"   # override default image (or use spec.images.redis for air-gap)
+  #   # password: ""             # optional; if empty, operator generates and stores in contentiq-redis-secrets
+  #   # resources:
+  #   #   requests: { cpu: "0.25", memory: "256Mi" }
+  #   #   limits:   { cpu: "0.5", memory: "256Mi" }
+  #   # config:
+  #   #   # dir: "/tmp"                   # default /tmp (ephemeral), /data (persistent)
+  #   #   # stopWritesOnBgsaveError: false
+  #   #   # appendOnly: false
+  #   #   # disableSave: false
+  #   #   # saveRules:
+  #   #   #   - seconds: 900
+  #   #   #     changes: 1
+  #   #   # extraArgs: []
+  #   # persistence:
+  #   #   # size: "1Gi"
+  #   #   # storageClass: ""
+  #   #   # accessModes: ["ReadWriteOnce"]
+  #   #   # annotations: {}
+  #   # securityContext:
+  #   #   # fsGroup: 1000
+  #   #   # fsGroupChangePolicy: "OnRootMismatch"
+  #   # external:
+  #   #   # secretName: "external-redis"
+  #   #   # urlKey: "REDIS_URL"
+
+  # Structured Data stack (CNPG/Postgres, Lakekeeper, Trino, edge gateways) is managed by the operator.
+  # Overrides (optional):
+  structuredData:
+    # Embedded manifests are the default (recommended)
+    useEmbeddedCharts: true
+    # manifestConfigMaps:
+    #   - my-rendered-structured-data-manifests  # only if useEmbeddedCharts=false
+    images:
+      lakekeeper: "quay.io/lakekeeper/catalog:v0.11.1"   # replace if mirrored
+      trino: "trinodb/trino:477"                        # replace if mirrored
+      postgres: "ghcr.io/cloudnative-pg/postgresql:18-standard-trixie"  # replace if mirrored

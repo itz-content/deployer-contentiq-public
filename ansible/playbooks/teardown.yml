@@ -1,0 +1,502 @@
+---
+# Teardown resources created by deploy.yml / CUSTOMER-GUIDE install path so clusters can be reinstalled cleanly.
+# Order: stop workloads → remove CR & CNPG/Helm → SCC from deploy.yml Step 7 → delete namespace →
+#   clean stale ContentIQ operator pods / rollout in openshift-operators (evicted, stuck after disk pressure) →
+#   OLM (subscription/CSV) → CatalogSource → optional CRI-O node image prune.
+# Run from ansible/: ansible-playbook -i inventory.yml playbooks/teardown.yml -e @parameters.yml
+# Optional: -e contentiq_teardown_confirm=true (required unless you pass -e contentiq_teardown_i_understand=true for automation)
+
+- name: ContentIQ teardown
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    contentiq_oc_binary: "oc"
+    contentiq_root_dir: "{{ playbook_dir | dirname }}"
+    contentiq_namespace: "contentiq"
+    # Must match CRD (see deploy.yml Step 4 CRD wait: contentiqs.contentiq.symplistic.ai)
+    contentiq_cr_name: "contentiq-instance"
+    contentiq_cr_plural_name: "contentiqs.contentiq.symplistic.ai"
+    contentiq_subscription_name: "contentiq"
+    contentiq_subscription_namespace: "openshift-operators"
+    contentiq_catalogsource_name: "contentiq-operators"
+    contentiq_catalogsource_namespace: "openshift-marketplace"
+    # deploy.yml Step 7: nonroot-v2 bindings (remove while namespaces still exist where applicable)
+    contentiq_teardown_remove_step7_scc: true
+    contentiq_cnpg_namespace: "cnpg-system"
+    contentiq_cnpg_deployment: "cnpg-controller-manager"
+    # Optional workload cleanup (existing cleanup.sh alignment)
+    contentiq_teardown_run_helm_uninstall: true
+    contentiq_teardown_helm_release_names:
+      - lakekeeper
+      - trino
+      - edge
+    contentiq_teardown_delete_cnpg_cluster: true
+    contentiq_cnpg_cluster_name: "postgres"
+    # Scale workloads before CR delete (helps stuck / excessive pods on small clusters)
+    contentiq_teardown_scale_workloads_to_zero: true
+    contentiq_teardown_force_delete_remaining_pods: true
+    # When true, skip every step that would stop or remove workloads in {{ contentiq_namespace }}
+    # (scale-to-zero, Helm uninstall, CNPG cluster, Step 7 SCC in that namespace, CR delete,
+    # force-delete pods, namespace delete). Use to exercise OLM/CatalogSource/operator teardown
+    # without waiting for a full app reinstall. Example:
+    #   ansible-playbook ... teardown.yml -e contentiq_teardown_confirm=true -e contentiq_teardown_preserve_contentiq_workloads=true
+    contentiq_teardown_preserve_contentiq_workloads: false
+    # Namespace and OLM
+    contentiq_teardown_delete_contentiq_namespace: true
+    contentiq_namespace_delete_timeout_seconds: 600
+    contentiq_teardown_remove_olm_subscription_and_csv: true
+    # Before removing Subscription/CSV: drop evicted/Completed/stuck operator pods and optionally restart the Deployment
+    # so the next deploy.yml run does not inherit a broken rollout (e.g. ephemeral-storage evictions on CRC).
+    contentiq_teardown_clean_stale_contentiq_operator_pods: true
+    contentiq_teardown_rollout_restart_contentiq_operator: true
+    contentiq_operator_deployment_name: "contentiq-operator-controller-manager"
+    contentiq_operator_pod_label: "app.kubernetes.io/name=contentiq-operator"
+    contentiq_teardown_remove_catalogsource: true
+    # Optional post-teardown cluster hygiene for small single-node clusters (e.g. CRC):
+    # removes completed/failed pods across namespaces that can accumulate and consume node ephemeral storage.
+    contentiq_teardown_prune_terminal_pods_all_namespaces: true
+    # Safety gate: fail teardown if any node still reports DiskPressure so next install does not start unhealthy.
+    contentiq_teardown_fail_if_diskpressure: true
+    # Dangerous: removes docker pull secret from namespaces (only if you know nothing else needs it)
+    contentiq_teardown_delete_pull_secrets: false
+    contentiq_pull_secret_name: "dockerhub-pull"
+    # CNPG operator namespace (not installed by deploy.yml; off by default)
+    contentiq_teardown_remove_cnpg_operator_namespace: false
+    # Optional: clean CRI-O/Podman image cache on each node (frees disk; can clear corrupt layers after ContentIQ uninstall).
+    # This does NOT remove ImageStreams in etcd; it runs on the node via oc debug + chroot /host crictl.
+    # Requires permission to debug nodes (typically cluster-admin). Off by default.
+    contentiq_teardown_prune_unused_node_images: false
+    # Explicit image refs to crictl rmi on each node (e.g. docker.io/symplisticai/contentiq-backend:1.2.31).
+    contentiq_teardown_remove_node_images: []
+
+  tasks:
+    - name: Verify oc client
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - version
+          - --client
+      changed_when: false
+
+    - name: Verify OpenShift login
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - whoami
+      changed_when: false
+
+    - name: Confirm teardown (safety)
+      ansible.builtin.assert:
+        that:
+          - (contentiq_teardown_confirm | default(false) | bool) or (contentiq_teardown_i_understand | default(false) | bool)
+        fail_msg: >-
+          Teardown deletes ContentIQ workloads and OLM objects. Re-run with
+          -e contentiq_teardown_confirm=true
+          or for automation -e contentiq_teardown_i_understand=true
+
+    - name: Check contentiq namespace exists
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - namespace
+          - "{{ contentiq_namespace }}"
+      register: contentiq_teardown_ns_check
+      changed_when: false
+      failed_when: false
+
+    - name: Scale all Deployments to zero in contentiq
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - scale
+          - deployment
+          - --all
+          - --replicas=0
+          - -n
+          - "{{ contentiq_namespace }}"
+      register: contentiq_teardown_scale_deploy
+      failed_when: false
+      changed_when: contentiq_teardown_scale_deploy.rc == 0
+      when:
+        - contentiq_teardown_scale_workloads_to_zero | bool
+        - contentiq_teardown_ns_check.rc == 0
+        - not (contentiq_teardown_preserve_contentiq_workloads | default(false) | bool)
+
+    - name: Scale all StatefulSets to zero in contentiq
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - scale
+          - statefulset
+          - --all
+          - --replicas=0
+          - -n
+          - "{{ contentiq_namespace }}"
+      register: contentiq_teardown_scale_sts
+      failed_when: false
+      changed_when: contentiq_teardown_scale_sts.rc == 0
+      when:
+        - contentiq_teardown_scale_workloads_to_zero | bool
+        - contentiq_teardown_ns_check.rc == 0
+        - not (contentiq_teardown_preserve_contentiq_workloads | default(false) | bool)
+
+    - name: Uninstall Helm releases (if helm is available)
+      ansible.builtin.shell: |
+        set -uo pipefail
+        if ! command -v helm >/dev/null 2>&1; then
+          exit 0
+        fi
+        for r in {{ contentiq_teardown_helm_release_names | join(' ') }}; do
+          if helm status -n "{{ contentiq_namespace }}" "$r" >/dev/null 2>&1; then
+            helm uninstall "$r" -n "{{ contentiq_namespace }}" || true
+          fi
+        done
+      args:
+        executable: /bin/bash
+      when:
+        - contentiq_teardown_run_helm_uninstall | bool
+        - contentiq_teardown_ns_check.rc == 0
+        - not (contentiq_teardown_preserve_contentiq_workloads | default(false) | bool)
+      failed_when: false
+      changed_when: false
+
+    - name: Delete CNPG Cluster resource (if present)
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - delete
+          - cluster
+          - "{{ item }}"
+          - -n
+          - "{{ contentiq_namespace }}"
+          - --ignore-not-found
+      loop:
+        - "{{ contentiq_cnpg_cluster_name }}"
+      when:
+        - contentiq_teardown_delete_cnpg_cluster | bool
+        - contentiq_teardown_ns_check.rc == 0
+        - not (contentiq_teardown_preserve_contentiq_workloads | default(false) | bool)
+      register: contentiq_teardown_cnpg_del
+      failed_when: false
+      changed_when: true
+
+    - name: Remove nonroot-v2 from lakekeeper and Trino service accounts (deploy.yml Step 7)
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - adm
+          - policy
+          - remove-scc-from-user
+          - nonroot-v2
+          - -n
+          - "{{ contentiq_namespace }}"
+          - -z
+          - "{{ item }}"
+      loop:
+        - lakekeeper
+        - trino
+      when:
+        - contentiq_teardown_remove_step7_scc | bool
+        - contentiq_teardown_ns_check.rc == 0
+        - not (contentiq_teardown_preserve_contentiq_workloads | default(false) | bool)
+      failed_when: false
+      changed_when: false
+
+    - name: Read CNPG controller service account for SCC removal
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - deployment
+          - "{{ contentiq_cnpg_deployment }}"
+          - -n
+          - "{{ contentiq_cnpg_namespace }}"
+          - -o
+          - jsonpath={.spec.template.spec.serviceAccountName}
+      register: contentiq_teardown_cnpg_sa_cmd
+      changed_when: false
+      failed_when: false
+      when:
+        - contentiq_teardown_remove_step7_scc | bool
+        - not (contentiq_teardown_preserve_contentiq_workloads | default(false) | bool)
+
+    - name: Remove nonroot-v2 from CNPG controller service account
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - adm
+          - policy
+          - remove-scc-from-user
+          - nonroot-v2
+          - -n
+          - "{{ contentiq_cnpg_namespace }}"
+          - -z
+          - "{{ (contentiq_teardown_cnpg_sa_cmd.stdout | trim) or 'default' }}"
+      when:
+        - contentiq_teardown_remove_step7_scc | bool
+        - contentiq_teardown_cnpg_sa_cmd.rc == 0
+        - not (contentiq_teardown_preserve_contentiq_workloads | default(false) | bool)
+      failed_when: false
+      changed_when: false
+
+    - name: Delete ContentIQ custom resource
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - delete
+          - "{{ contentiq_cr_plural_name }}"
+          - "{{ contentiq_cr_name }}"
+          - -n
+          - "{{ contentiq_namespace }}"
+          - --ignore-not-found
+      when:
+        - contentiq_teardown_ns_check.rc == 0
+        - not (contentiq_teardown_preserve_contentiq_workloads | default(false) | bool)
+      register: contentiq_teardown_cr_del
+      failed_when: false
+      changed_when: "'deleted' in contentiq_teardown_cr_del.stdout | default('')"
+
+    - name: Force-delete remaining pods in contentiq (stuck / Unknown)
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - delete
+          - pod
+          - --all
+          - -n
+          - "{{ contentiq_namespace }}"
+          - --grace-period=0
+          - --force
+      when:
+        - contentiq_teardown_force_delete_remaining_pods | bool
+        - contentiq_teardown_ns_check.rc == 0
+        - not (contentiq_teardown_preserve_contentiq_workloads | default(false) | bool)
+      failed_when: false
+      changed_when: true
+
+    - name: Delete docker pull secret from namespaces (optional)
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - delete
+          - secret
+          - "{{ contentiq_pull_secret_name }}"
+          - -n
+          - "{{ item }}"
+          - --ignore-not-found
+      loop:
+        - openshift-marketplace
+        - openshift-operators
+        - "{{ contentiq_namespace }}"
+      when:
+        - contentiq_teardown_delete_pull_secrets | bool
+        - (not (contentiq_teardown_preserve_contentiq_workloads | default(false) | bool))
+          or (item | string != contentiq_namespace | string)
+      failed_when: false
+      changed_when: true
+
+    - name: Delete contentiq namespace
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - delete
+          - namespace
+          - "{{ contentiq_namespace }}"
+          - --wait=true
+          - "--timeout={{ contentiq_namespace_delete_timeout_seconds }}s"
+      when:
+        - contentiq_teardown_delete_contentiq_namespace | bool
+        - contentiq_teardown_ns_check.rc == 0
+        - not (contentiq_teardown_preserve_contentiq_workloads | default(false) | bool)
+      register: contentiq_teardown_ns_del
+      failed_when: false
+      changed_when: "'deleted' in contentiq_teardown_ns_del.stdout | default('')"
+
+    - name: Delete non-Running ContentIQ operator pods in openshift-operators (evicted, Completed, Failed, Pending)
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - delete
+          - pods
+          - -n
+          - "{{ contentiq_subscription_namespace }}"
+          - -l
+          - "{{ contentiq_operator_pod_label }}"
+          - --field-selector=status.phase!=Running
+          - --ignore-not-found
+      register: contentiq_teardown_del_operator_pods
+      failed_when: false
+      changed_when: >-
+        contentiq_teardown_del_operator_pods.rc == 0
+        and ('deleted' in (contentiq_teardown_del_operator_pods.stdout | default('')))
+      when: contentiq_teardown_clean_stale_contentiq_operator_pods | bool
+
+    - name: Rollout restart ContentIQ operator deployment (fresh replica set before OLM removal)
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - rollout
+          - restart
+          - "deployment/{{ contentiq_operator_deployment_name }}"
+          - -n
+          - "{{ contentiq_subscription_namespace }}"
+      register: contentiq_teardown_operator_rollout
+      failed_when: false
+      changed_when: contentiq_teardown_operator_rollout.rc == 0
+      when: contentiq_teardown_rollout_restart_contentiq_operator | bool
+
+    - name: Delete operator Subscription
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - delete
+          - subscription
+          - "{{ contentiq_subscription_name }}"
+          - -n
+          - "{{ contentiq_subscription_namespace }}"
+          - --ignore-not-found
+      when: contentiq_teardown_remove_olm_subscription_and_csv | bool
+      failed_when: false
+      changed_when: true
+
+    - name: List CSVs matching contentiq in openshift-operators
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail &&
+          {{ contentiq_oc_binary }} get csv -n {{ contentiq_subscription_namespace }}
+          --no-headers 2>/dev/null | awk '/contentiq/{print $1}' || true
+      args:
+        executable: /bin/bash
+      register: contentiq_teardown_csv_list
+      changed_when: false
+      when: contentiq_teardown_remove_olm_subscription_and_csv | bool
+
+    - name: Delete ContentIQ-related ClusterServiceVersions
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - delete
+          - csv
+          - "{{ item }}"
+          - -n
+          - "{{ contentiq_subscription_namespace }}"
+          - --ignore-not-found
+      loop: "{{ contentiq_teardown_csv_list.stdout_lines | default([]) | map('trim') | reject('equalto', '') | list }}"
+      when:
+        - contentiq_teardown_remove_olm_subscription_and_csv | bool
+        - (contentiq_teardown_csv_list.stdout_lines | default([]) | length) > 0
+      failed_when: false
+      changed_when: true
+
+    - name: Delete CatalogSource
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - delete
+          - catalogsource
+          - "{{ contentiq_catalogsource_name }}"
+          - -n
+          - "{{ contentiq_catalogsource_namespace }}"
+          - --ignore-not-found
+      when: contentiq_teardown_remove_catalogsource | bool
+      failed_when: false
+      changed_when: true
+
+    - name: Remove CNPG operator namespace (optional, not created by deploy.yml)
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - delete
+          - namespace
+          - "{{ contentiq_cnpg_namespace }}"
+          - --wait=true
+          - --timeout=300s
+      when: contentiq_teardown_remove_cnpg_operator_namespace | bool
+      failed_when: false
+      changed_when: true
+
+    - name: Prune Failed/Succeeded pods across all namespaces (optional)
+      ansible.builtin.shell: |
+        set -o pipefail
+        {{ contentiq_oc_binary }} delete pod --all-namespaces --field-selector=status.phase=Failed --ignore-not-found || true
+        {{ contentiq_oc_binary }} delete pod --all-namespaces --field-selector=status.phase=Succeeded --ignore-not-found || true
+      args:
+        executable: /bin/bash
+      register: contentiq_teardown_cluster_pod_prune
+      when: contentiq_teardown_prune_terminal_pods_all_namespaces | bool
+      failed_when: false
+      changed_when: "'deleted' in (contentiq_teardown_cluster_pod_prune.stdout | default(''))"
+
+    - name: Resolve cluster node names for optional CRI-O image cleanup
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - nodes
+          - -o
+          - jsonpath={.items[*].metadata.name}
+      register: contentiq_teardown_node_names_cmd
+      changed_when: false
+      when:
+        - (contentiq_teardown_prune_unused_node_images | default(false) | bool)
+          or ((contentiq_teardown_remove_node_images | default([])) | length > 0)
+
+    - name: Remove listed images and optionally prune unused images on each node (CRI-O)
+      ansible.builtin.shell: |
+        set -uo pipefail
+        {{ contentiq_oc_binary }} debug "node/{{ item }}" --quiet -- \
+          chroot /host bash -lc '
+          set +e
+          {% for img in contentiq_teardown_remove_node_images | default([]) %}
+          crictl rmi "{{ img }}" 2>/dev/null || true
+          {% endfor %}
+          {% if contentiq_teardown_prune_unused_node_images | default(false) | bool %}
+          crictl rmi --prune 2>/dev/null || true
+          {% endif %}
+          '
+      args:
+        executable: /bin/bash
+      loop: "{{ (contentiq_teardown_node_names_cmd.stdout | default('') | trim).split() | reject('equalto', '') | list }}"
+      when:
+        - (contentiq_teardown_prune_unused_node_images | default(false) | bool)
+          or ((contentiq_teardown_remove_node_images | default([])) | length > 0)
+        - contentiq_teardown_node_names_cmd is defined
+        - contentiq_teardown_node_names_cmd.rc == 0
+        - (contentiq_teardown_node_names_cmd.stdout | default('') | trim | length) > 0
+      register: contentiq_teardown_crio_image_cleanup
+      failed_when: false
+      changed_when: true
+
+    - name: Check nodes with DiskPressure=True
+      ansible.builtin.shell: |
+        set -o pipefail
+        {{ contentiq_oc_binary }} get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{range .status.conditions[?(@.type=="DiskPressure")]}{.status}{end}{"\n"}{end}' \
+          | awk '$2 == "True" {print $1}'
+      args:
+        executable: /bin/bash
+      register: contentiq_teardown_diskpressure_nodes
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if node DiskPressure remains after teardown
+      ansible.builtin.assert:
+        that:
+          - (contentiq_teardown_diskpressure_nodes.stdout_lines | default([]) | length) == 0
+        fail_msg: >-
+          Node(s) still report DiskPressure after teardown:
+          {{ contentiq_teardown_diskpressure_nodes.stdout_lines | default([]) | join(', ') }}.
+          Free node disk (ephemeral storage), then re-run teardown or clear pressure before running deploy.yml.
+      when: contentiq_teardown_fail_if_diskpressure | bool
+
+    - name: Teardown summary
+      ansible.builtin.debug:
+        msg:
+          - "ContentIQ teardown finished. Re-run deploy.yml for a fresh install."
+          - "If openshift-marketplace pods look stale: oc delete pod -l olm.catalogSource=contentiq-operators -n openshift-marketplace --ignore-not-found"
+          - "Stale operator pod cleanup (optional): -e contentiq_teardown_clean_stale_contentiq_operator_pods=false / rollout: -e contentiq_teardown_rollout_restart_contentiq_operator=false"
+          - "Cluster pod prune (optional): -e contentiq_teardown_prune_terminal_pods_all_namespaces=false"
+          - "Keep contentiq app pods running (OLM/catalog/operator teardown only): -e contentiq_teardown_preserve_contentiq_workloads=true"
+          - "Node CRI-O image cache (optional): -e contentiq_teardown_prune_unused_node_images=true and/or -e contentiq_teardown_remove_node_images='[\"docker.io/org/img:tag\"]' (requires oc debug node)"

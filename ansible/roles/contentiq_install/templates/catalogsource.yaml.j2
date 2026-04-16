@@ -1,0 +1,15 @@
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: contentiq-operators
+  namespace: openshift-marketplace
+spec:
+  sourceType: grpc
+  image: {{ contentiq_images.catalog | quote }}
+  secrets:
+    - {{ contentiq_pull_secret_name }}
+  displayName: ContentIQ Operators
+  publisher: symplisticai
+  updateStrategy:
+    registryPoll:
+      interval: 45m

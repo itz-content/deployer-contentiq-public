@@ -1,0 +1,12 @@
+---
+contentiq_wait_delay_seconds: 10
+contentiq_wait_retries: 2147483647
+contentiq_rollout_timeout_seconds: 14400
+contentiq_min_progress_deadline_seconds: 14400
+contentiq_apply_min_progress_deadline: true
+
+contentiq_install_deployment_mode: connected
+contentiq_install_manage_mirror: false
+contentiq_install_manage_operator: true
+contentiq_install_manage_secrets: true
+contentiq_install_manage_cr: true

@@ -1,0 +1,98 @@
+---
+# CUSTOMER-GUIDE.md — Step 3: Register Operator Catalog, then link pull secrets / restart pod / wait READY
+
+- name: Render CatalogSource manifest (template mode)
+  ansible.builtin.template:
+    src: catalogsource.yaml.j2
+    dest: "{{ contentiq_render_dir }}/catalogsource.yaml"
+    mode: "0644"
+  when: contentiq_catalogsource_apply_mode == 'template'
+
+- name: Apply CatalogSource manifest (rendered template)
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - apply
+      - -f
+      - "{{ contentiq_render_dir }}/catalogsource.yaml"
+  register: contentiq_install_catalog_apply
+  changed_when: >-
+    'created' in contentiq_install_catalog_apply.stdout
+    or 'configured' in contentiq_install_catalog_apply.stdout
+  when: contentiq_catalogsource_apply_mode == 'template'
+
+- name: Apply CatalogSource from deployment bundle (oc apply -f 02-catalogsource.yaml)
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - apply
+      - -f
+      - "{{ contentiq_bundle_manifest_catalogsource }}"
+  register: contentiq_install_catalog_apply
+  changed_when: >-
+    'created' in contentiq_install_catalog_apply.stdout
+    or 'configured' in contentiq_install_catalog_apply.stdout
+  when: contentiq_catalogsource_apply_mode == 'bundle'
+
+- name: Wait for catalog service account to exist
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - serviceaccount
+      - "{{ contentiq_catalog_serviceaccount_name }}"
+      - -n
+      - "{{ contentiq_catalogsource_namespace }}"
+  register: contentiq_install_catalog_sa_wait
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_install_catalog_sa_wait.rc == 0
+
+- name: Link pull secret to catalog service accounts
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - secrets
+      - link
+      - "{{ item }}"
+      - "{{ contentiq_pull_secret_name }}"
+      - --for=pull
+      - -n
+      - "{{ contentiq_catalogsource_namespace }}"
+  loop:
+    - "{{ contentiq_catalog_serviceaccount_name }}"
+    - default
+  changed_when: false
+  when: contentiq_manage_pull_secret | bool
+
+- name: Restart catalog source pod to pick up pull secret
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - delete
+      - pod
+      - -l
+      - "olm.catalogSource={{ contentiq_catalogsource_name }}"
+      - -n
+      - "{{ contentiq_catalogsource_namespace }}"
+      - --ignore-not-found
+  register: contentiq_install_catalog_pod_restart
+  changed_when: "'deleted' in contentiq_install_catalog_pod_restart.stdout"
+
+- name: Wait for CatalogSource to report READY
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - catalogsource
+      - "{{ contentiq_catalogsource_name }}"
+      - -n
+      - "{{ contentiq_catalogsource_namespace }}"
+      - -o
+      - jsonpath={.status.connectionState.lastObservedState}
+  register: contentiq_install_catalog_ready
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_install_catalog_ready.stdout == "READY"

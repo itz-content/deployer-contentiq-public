@@ -1,0 +1,34 @@
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: contentiq-operators
+  namespace: openshift-marketplace
+spec:
+  sourceType: grpc
+  # Air-gapped/mirrored template:
+  # - Mirror all images from 06-image-list.txt, then point everything to your registry.
+  # - CatalogSource example (this file):
+  #     image: <reg>/symplisticai/contentiq-operator-catalog:1.2.2
+  # - Operator + app image examples (set in the CR at manifests/contentiq-custom-resource.yaml):
+  #     spec.images.frontend:        <reg>/symplisticai/contentiq-frontend:1.2.2
+  #     spec.images.backend:         <reg>/symplisticai/contentiq-backend:1.2.2
+  #     spec.images.rag:             <reg>/symplisticai/personalization-rag:1.2.2
+  #     spec.structuredData.images.lakekeeper: <reg>/lakekeeper/catalog:v0.11.1
+  #     spec.structuredData.images.trino:      <reg>/trinodb/trino:477
+  #     spec.structuredData.images.postgres:   <reg>/cloudnative-pg/postgresql:18-standard-trixie
+  # - Other operator-managed images (covered by IDMS/ICSP or add to CR overrides if you prefer):
+  #     <reg>/cloudnative-pg/cloudnative-pg:1.24.1
+  #     <reg>/curlimages/curl:latest
+  #     <reg>/library/python:3.11-alpine
+  #     <reg>/library/nginx:1.27-alpine
+  # - If you used `oc mirror`, you can instead apply the generated CatalogSource
+  #   from oc-mirror-workspace/results-*/catalogSource*.yaml.
+  image: docker.io/symplisticai/contentiq-operator-catalog:1.2.31
+  # Required for private Docker Hub (or registry) - name of pull secret in openshift-marketplace
+  secrets:
+    - dockerhub-pull
+  displayName: ContentIQ Operators
+  publisher: symplisticai
+  updateStrategy:
+    registryPoll:
+      interval: 45m

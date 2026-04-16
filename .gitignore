@@ -1,0 +1,6 @@
+.DS_Store
+
+# Sensitive Ansible vars and secrets (never commit)
+ansible/parameters.yml
+ansible/parameters.local.yml
+ansible/secrets/

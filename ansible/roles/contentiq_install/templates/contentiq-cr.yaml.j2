@@ -1,0 +1,48 @@
+apiVersion: contentiq.symplistic.ai/v1alpha1
+kind: ContentIQ
+metadata:
+  name: {{ contentiq_custom_resource_name }}
+  namespace: {{ contentiq_namespace }}
+spec:
+  namespace: {{ contentiq_namespace }}
+  images:
+    frontend: {{ contentiq_images.frontend | quote }}
+    backend: {{ contentiq_images.backend | quote }}
+    rag: {{ contentiq_images.rag | quote }}
+    redis: {{ contentiq_images.redis | quote }}
+{% if contentiq_image_pull_secrets %}
+  imagePullSecrets:
+{% for secret in contentiq_image_pull_secrets %}
+    - name: {{ secret.name | quote }}
+{% endfor %}
+{% endif %}
+  backendReplicas: {{ contentiq_replicas.backend }}
+  frontendReplicas: {{ contentiq_replicas.frontend }}
+  ragReplicas: {{ contentiq_replicas.rag }}
+  routes:
+    frontend:
+      enabled: true
+{% if contentiq_install_frontend_hostname | default(contentiq_routes.frontend_hostname) %}
+      hostname: {{ (contentiq_install_frontend_hostname | default(contentiq_routes.frontend_hostname)) | quote }}
+{% endif %}
+    backend:
+      enabled: true
+{% if contentiq_install_backend_hostname | default(contentiq_routes.backend_hostname) %}
+      hostname: {{ (contentiq_install_backend_hostname | default(contentiq_routes.backend_hostname)) | quote }}
+{% endif %}
+      cors:
+        enabled: true
+  backendResources:
+{{ contentiq_backend_resources | to_nice_yaml(indent=2) | indent(4, true) }}
+  frontendResources:
+{{ contentiq_frontend_resources | to_nice_yaml(indent=2) | indent(4, true) }}
+  ragResources:
+{{ contentiq_rag_resources | to_nice_yaml(indent=2) | indent(4, true) }}
+  redis:
+    mode: {{ contentiq_redis.mode | quote }}
+  structuredData:
+    useEmbeddedCharts: {{ contentiq_structured_data.use_embedded_charts | bool }}
+    images:
+      lakekeeper: {{ contentiq_images.lakekeeper | quote }}
+      trino: {{ contentiq_images.trino | quote }}
+      postgres: {{ contentiq_images.postgres | quote }}

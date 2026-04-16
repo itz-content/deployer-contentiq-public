@@ -1,0 +1,196 @@
+---
+# CUSTOMER-GUIDE.md — Step 7: Structured Data (SCC for CNPG/Lakekeeper/Trino, pull links, pgvector)
+
+- name: Wait for CNPG controller deployment to exist
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - deployment
+      - "{{ contentiq_structured_data.cnpg_deployment_name }}"
+      - -n
+      - "{{ contentiq_structured_data.cnpg_namespace }}"
+  register: contentiq_install_cnpg_deployment_wait
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_install_cnpg_deployment_wait.rc == 0
+  when: contentiq_structured_data.grant_scc | bool
+
+- name: Read CNPG controller service account name
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - deployment
+      - "{{ contentiq_structured_data.cnpg_deployment_name }}"
+      - -n
+      - "{{ contentiq_structured_data.cnpg_namespace }}"
+      - -o
+      - jsonpath={.spec.template.spec.serviceAccountName}
+  register: contentiq_install_cnpg_serviceaccount_cmd
+  changed_when: false
+  when: contentiq_structured_data.grant_scc | bool
+
+- name: Set effective CNPG service account name
+  ansible.builtin.set_fact:
+    contentiq_install_cnpg_serviceaccount: "{{ (contentiq_install_cnpg_serviceaccount_cmd.stdout | trim) or 'default' }}"
+  when: contentiq_structured_data.grant_scc | bool
+
+- name: Wait for lakekeeper and trino service accounts
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - serviceaccount
+      - "{{ item }}"
+      - -n
+      - "{{ contentiq_namespace }}"
+  loop:
+    - lakekeeper
+    - trino
+  register: contentiq_install_structured_data_sa_wait
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_install_structured_data_sa_wait.rc == 0
+  when: contentiq_structured_data.grant_scc | bool
+
+- name: Grant nonroot-v2 SCC to Structured Data service accounts
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - adm
+      - policy
+      - add-scc-to-user
+      - nonroot-v2
+      - -n
+      - "{{ item.namespace }}"
+      - -z
+      - "{{ item.serviceaccount }}"
+  loop:
+    - namespace: "{{ contentiq_structured_data.cnpg_namespace }}"
+      serviceaccount: "{{ contentiq_install_cnpg_serviceaccount }}"
+    - namespace: "{{ contentiq_namespace }}"
+      serviceaccount: lakekeeper
+    - namespace: "{{ contentiq_namespace }}"
+      serviceaccount: trino
+  changed_when: false
+  when: contentiq_structured_data.grant_scc | bool
+
+- name: Link pull secret to Structured Data service accounts
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - secrets
+      - link
+      - "{{ item }}"
+      - "{{ contentiq_pull_secret_name }}"
+      - --for=pull
+      - -n
+      - "{{ contentiq_namespace }}"
+  loop:
+    - lakekeeper
+    - trino
+    - default
+  changed_when: false
+  when:
+    - contentiq_manage_pull_secret | bool
+    - item != 'default' or contentiq_structured_data.link_default_pull_secret | bool
+
+# cluster=postgres alone matches initdb Job pods; require instance primary for oc exec into postgres container.
+- name: Wait for Postgres pod to exist
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - pod
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -l
+      - cnpg.io/cluster=postgres,cnpg.io/podRole=instance,cnpg.io/instanceRole=primary
+      - -o
+      - jsonpath={.items[0].metadata.name}
+  register: contentiq_install_postgres_pod_cmd
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_install_postgres_pod_cmd.stdout | trim | length > 0
+  when: contentiq_structured_data.enable_pgvector | bool
+
+- name: Wait for Postgres pod to be running
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - pod
+      - "{{ contentiq_install_postgres_pod_cmd.stdout | trim }}"
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.status.phase}
+  register: contentiq_install_postgres_phase
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_install_postgres_phase.stdout == "Running"
+  when: contentiq_structured_data.enable_pgvector | bool
+
+- name: Check whether pgvector is already enabled
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - exec
+      - -n
+      - "{{ contentiq_namespace }}"
+      - "{{ contentiq_install_postgres_pod_cmd.stdout | trim }}"
+      - -c
+      - postgres
+      - --
+      - psql
+      - -U
+      - postgres
+      - -d
+      - lakekeeper_metadata
+      - -tAc
+      - "SELECT 1 FROM pg_extension WHERE extname='vector';"
+  register: contentiq_install_pgvector_check
+  changed_when: false
+  when: contentiq_structured_data.enable_pgvector | bool
+
+- name: Enable pgvector in lakekeeper_metadata
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - exec
+      - -n
+      - "{{ contentiq_namespace }}"
+      - "{{ contentiq_install_postgres_pod_cmd.stdout | trim }}"
+      - -c
+      - postgres
+      - --
+      - psql
+      - -U
+      - postgres
+      - -d
+      - lakekeeper_metadata
+      - -c
+      - "CREATE EXTENSION IF NOT EXISTS vector;"
+  register: contentiq_install_pgvector_enable
+  changed_when: true
+  when:
+    - contentiq_structured_data.enable_pgvector | bool
+    - contentiq_install_pgvector_check.stdout | trim != "1"
+
+- name: Optionally rerun the Lakekeeper migration job
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - delete
+      - job/lakekeeper-db-migration-1
+      - -n
+      - "{{ contentiq_namespace }}"
+      - --ignore-not-found
+  register: contentiq_install_migration_job_delete
+  changed_when: "'deleted' in contentiq_install_migration_job_delete.stdout"
+  when: contentiq_structured_data.rerun_migration_job | bool

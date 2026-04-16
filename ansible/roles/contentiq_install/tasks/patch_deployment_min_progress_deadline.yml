@@ -1,0 +1,50 @@
+---
+# Required: patch_dep_name, patch_dep_namespace, contentiq_oc_binary, contentiq_min_progress_deadline_seconds
+# Optional: contentiq_apply_min_progress_deadline (default true)
+# Raises spec.progressDeadlineSeconds on a Deployment when it is unset or below the minimum (default 90m).
+- name: "Ensure deployment progress deadline is at least {{ contentiq_min_progress_deadline_seconds }}s"
+  when: contentiq_apply_min_progress_deadline | default(true) | bool
+  block:
+    - name: Read current progressDeadlineSeconds
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - deployment
+          - "{{ patch_dep_name }}"
+          - -n
+          - "{{ patch_dep_namespace }}"
+          - -o
+          - jsonpath={.spec.progressDeadlineSeconds}
+      register: contentiq_patch_pd_get
+      changed_when: false
+      failed_when: false
+
+    - name: Patch deployment when progressDeadlineSeconds is below minimum
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - patch
+          - deployment
+          - "{{ patch_dep_name }}"
+          - -n
+          - "{{ patch_dep_namespace }}"
+          - -p
+          - "{{ {'spec': {'progressDeadlineSeconds': contentiq_min_progress_deadline_seconds | int}} | to_json }}"
+          - --type
+          - merge
+      register: contentiq_patch_pd_apply
+      changed_when: >-
+        'patched' in (contentiq_patch_pd_apply.stdout | default(''))
+        or 'configured' in (contentiq_patch_pd_apply.stdout | default(''))
+      when:
+        - contentiq_patch_pd_get.rc == 0
+        - >-
+          (
+            (contentiq_patch_pd_get.stdout | default('') | trim | length == 0)
+            | ternary(
+                600,
+                (contentiq_patch_pd_get.stdout | default('') | trim | int)
+              )
+          )
+          < (contentiq_min_progress_deadline_seconds | int)

@@ -1,0 +1,26 @@
+---
+# Included with loop: rollout_dep_name, rollout_dep_idx, rollout_dep_list (full list for last-item check).
+- name: "Step 6: Ensure progress deadline before deployment rollout wait"
+  ansible.builtin.include_tasks: patch_deployment_min_progress_deadline.yml
+  vars:
+    patch_dep_name: "{{ rollout_dep_name }}"
+    patch_dep_namespace: "{{ contentiq_namespace }}"
+
+- name: "Step 6: Wait for deployment rollout"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - rollout
+      - status
+      - "deployment/{{ rollout_dep_name }}"
+      - -n
+      - "{{ contentiq_namespace }}"
+      - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
+  changed_when: false
+
+- name: "Step 6: Pause before next deployment (memory / scheduling breathing room)"
+  ansible.builtin.pause:
+    seconds: "{{ contentiq_rollout_pause_between_deployments_seconds | int }}"
+  when:
+    - (contentiq_rollout_pause_between_deployments_seconds | int) > 0
+    - rollout_dep_idx < ((rollout_dep_list | length) - 1)

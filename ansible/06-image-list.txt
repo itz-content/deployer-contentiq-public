@@ -1,0 +1,36 @@
+# ContentIQ Operator Images (Version 1.0.0)
+# All images used by the operator deployment; mirror to your internal registry for disconnected/air-gapped installs.
+
+# Application Images (these are your existing images)
+docker.io/symplisticai/contentiq-frontend:1.2.3
+docker.io/symplisticai/contentiq-backend:1.2.3
+docker.io/symplisticai/personalization-rag:1.2.3
+
+# Redis (operator-managed; mirror for air-gap and set spec.images.redis if needed)
+docker.io/library/redis:7-alpine
+
+# Customers must set these in spec.images of the ContentIQ Custom Resource (pointing to their registry/mirror)
+
+# Structured Data Stack (operator-managed; embedded defaults always enabled)
+# Defaults map to spec.structuredData.images.{lakekeeper,trino,postgres}
+ghcr.io/cloudnative-pg/cloudnative-pg:1.24.1
+ghcr.io/cloudnative-pg/postgresql:18-standard-trixie
+
+# Default Lakekeeper image (public)
+quay.io/lakekeeper/catalog:v0.11.1
+trinodb/trino:477
+curlimages/curl:latest
+
+# Edge gateways (operator-managed; embedded defaults)
+docker.io/library/python:3.11-alpine
+docker.io/library/nginx:1.27-alpine
+
+# Operator Images (these need to be built and published by the vendor)
+docker.io/symplisticai/contentiq-operator:1.2.3
+docker.io/symplisticai/contentiq-operator-bundle:1.2.3
+docker.io/symplisticai/contentiq-operator-catalog:1.2.3
+
+# For disconnected/air-gapped deployments:
+# 1. Mirror all images listed above to your internal registry (plus any optional overrides you enable)
+# 2. Update 02-catalogsource.yaml to point to the mirrored catalog image
+# 3. Ensure pull secrets are configured for the internal registry

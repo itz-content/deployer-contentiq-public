@@ -1,0 +1,147 @@
+---
+# CUSTOMER-GUIDE.md — Step 4: Install Operator (Subscription), link operator SA pull secret, wait CSV/CRD
+
+- name: Render Subscription manifest (template mode)
+  ansible.builtin.template:
+    src: subscription.yaml.j2
+    dest: "{{ contentiq_render_dir }}/subscription.yaml"
+    mode: "0644"
+  when: contentiq_subscription_apply_mode == 'template'
+
+- name: Apply Subscription manifest (rendered template)
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - apply
+      - -f
+      - "{{ contentiq_render_dir }}/subscription.yaml"
+  register: contentiq_install_subscription_apply
+  changed_when: >-
+    'created' in contentiq_install_subscription_apply.stdout
+    or 'configured' in contentiq_install_subscription_apply.stdout
+  when: contentiq_subscription_apply_mode == 'template'
+
+- name: Apply Subscription from deployment bundle (oc apply -f 03-subscription.yaml)
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - apply
+      - -f
+      - "{{ contentiq_bundle_manifest_subscription }}"
+  register: contentiq_install_subscription_apply
+  changed_when: >-
+    'created' in contentiq_install_subscription_apply.stdout
+    or 'configured' in contentiq_install_subscription_apply.stdout
+  when: contentiq_subscription_apply_mode == 'bundle'
+
+- name: Wait for operator service account to exist
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - serviceaccount
+      - "{{ contentiq_operator_serviceaccount_name }}"
+      - -n
+      - "{{ contentiq_operator_namespace }}"
+  register: contentiq_install_operator_sa_wait
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_install_operator_sa_wait.rc == 0
+
+- name: Link pull secret to operator service account
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - secrets
+      - link
+      - "{{ contentiq_operator_serviceaccount_name }}"
+      - "{{ contentiq_pull_secret_name }}"
+      - --for=pull
+      - -n
+      - "{{ contentiq_operator_namespace }}"
+  changed_when: false
+  when: contentiq_manage_pull_secret | bool
+
+- name: Restart operator pod after linking pull secret
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - delete
+      - pod
+      - -n
+      - "{{ contentiq_operator_namespace }}"
+      - -l
+      - "{{ contentiq_operator_pod_label }}"
+      - --ignore-not-found
+  register: contentiq_install_operator_pod_restart
+  changed_when: "'deleted' in contentiq_install_operator_pod_restart.stdout"
+  when: contentiq_manage_pull_secret | bool
+
+- name: Wait for subscription to report an installed CSV
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - subscription
+      - "{{ contentiq_subscription_name }}"
+      - -n
+      - "{{ contentiq_operator_namespace }}"
+      - -o
+      - jsonpath={.status.installedCSV}
+  register: contentiq_install_installed_csv_cmd
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_install_installed_csv_cmd.stdout | trim | length > 0
+
+- name: Store installed CSV name
+  ansible.builtin.set_fact:
+    contentiq_install_installed_csv: "{{ contentiq_install_installed_csv_cmd.stdout | trim }}"
+
+- name: Wait for installed CSV to succeed
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - csv
+      - "{{ contentiq_install_installed_csv }}"
+      - -n
+      - "{{ contentiq_operator_namespace }}"
+      - -o
+      - jsonpath={.status.phase}
+  register: contentiq_install_csv_phase
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_install_csv_phase.stdout == "Succeeded"
+
+- name: Wait for ContentIQ CRD to exist
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - crd
+      - contentiqs.contentiq.symplistic.ai
+  register: contentiq_install_crd_wait
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_install_crd_wait.rc == 0
+
+- name: Wait for operator deployment to be available
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - deployment
+      - "{{ contentiq_operator_deployment_name }}"
+      - -n
+      - "{{ contentiq_operator_namespace }}"
+      - -o
+      - jsonpath={.status.availableReplicas}
+  register: contentiq_install_operator_available
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: (contentiq_install_operator_available.stdout | default('0')) | int > 0

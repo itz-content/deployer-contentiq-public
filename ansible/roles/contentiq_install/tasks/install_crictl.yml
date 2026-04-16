@@ -1,0 +1,61 @@
+---
+# Install crictl from upstream cri-tools (kubernetes-sigs/cri-tools) on the target host(s).
+# Intended for inventories where Ansible SSHs to OpenShift/RHCOS nodes directly.
+# Default ContentIQ playbooks run on localhost and use "oc debug node/..." instead — do not
+# include this unless your inventory actually lists cluster nodes as managed hosts.
+#
+# Expected facts: ansible_architecture (requires gather_facts: true on the play).
+
+- name: Map ansible_architecture to cri-tools release arch name
+  ansible.builtin.set_fact:
+    contentiq_crictl_dl_arch: >-
+      {{
+        'amd64' if ansible_architecture == 'x86_64' else
+        ('arm64' if ansible_architecture in ['aarch64', 'arm64'] else ansible_architecture)
+      }}
+
+- name: Build cri-tools download URL
+  ansible.builtin.set_fact:
+    contentiq_crictl_tarball_url: "{{ 'https://github.com/kubernetes-sigs/cri-tools/releases/download/' ~ contentiq_crictl_version ~ '/crictl-' ~ contentiq_crictl_version ~ '-linux-' ~ contentiq_crictl_dl_arch ~ '.tar.gz' }}"
+    contentiq_crictl_tarball_path: "{{ '/tmp/crictl-' ~ contentiq_crictl_version ~ '-linux-' ~ contentiq_crictl_dl_arch ~ '.tar.gz' }}"
+
+- name: Download cri-tools tarball
+  ansible.builtin.get_url:
+    url: "{{ contentiq_crictl_tarball_url }}"
+    dest: "{{ contentiq_crictl_tarball_path }}"
+    mode: "0644"
+  become: true
+
+- name: Extract crictl into /usr/local/bin
+  ansible.builtin.unarchive:
+    src: "{{ contentiq_crictl_tarball_path }}"
+    dest: /usr/local/bin
+    remote_src: true
+    extra_opts:
+      - "--no-same-owner"
+  become: true
+
+- name: Ensure crictl is executable
+  ansible.builtin.file:
+    path: /usr/local/bin/crictl
+    mode: "0755"
+    state: file
+  become: true
+
+- name: Remove downloaded tarball
+  ansible.builtin.file:
+    path: "{{ contentiq_crictl_tarball_path }}"
+    state: absent
+  become: true
+
+- name: Show crictl client version (no CRI socket required)
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/crictl
+      - --version
+  register: contentiq_crictl_version_out
+  changed_when: false
+
+- name: Display crictl version
+  ansible.builtin.debug:
+    var: contentiq_crictl_version_out.stdout_lines

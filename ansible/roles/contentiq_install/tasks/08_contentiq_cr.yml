@@ -1,0 +1,50 @@
+---
+# CUSTOMER-GUIDE.md — Step 6: Deploy ContentIQ instance (Custom Resource)
+
+- name: Render ContentIQ custom resource (template mode)
+  ansible.builtin.template:
+    src: contentiq-cr.yaml.j2
+    dest: "{{ contentiq_render_dir }}/contentiq-cr.yaml"
+    mode: "0644"
+  when: contentiq_contentiq_cr_apply_mode == 'template'
+
+- name: Apply ContentIQ custom resource (rendered template)
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - apply
+      - -f
+      - "{{ contentiq_render_dir }}/contentiq-cr.yaml"
+  register: contentiq_install_cr_apply
+  changed_when: >-
+    'created' in contentiq_install_cr_apply.stdout
+    or 'configured' in contentiq_install_cr_apply.stdout
+  when: contentiq_contentiq_cr_apply_mode == 'template'
+
+- name: Apply ContentIQ custom resource from deployment bundle (oc apply -f ansible/manifests/contentiq-custom-resource.yaml)
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - apply
+      - -f
+      - "{{ contentiq_bundle_manifest_contentiq_cr }}"
+  register: contentiq_install_cr_apply
+  changed_when: >-
+    'created' in contentiq_install_cr_apply.stdout
+    or 'configured' in contentiq_install_cr_apply.stdout
+  when: contentiq_contentiq_cr_apply_mode == 'bundle'
+
+- name: Wait for ContentIQ custom resource to exist
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - contentiq
+      - "{{ contentiq_custom_resource_name }}"
+      - -n
+      - "{{ contentiq_namespace }}"
+  register: contentiq_install_cr_wait
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_install_cr_wait.rc == 0

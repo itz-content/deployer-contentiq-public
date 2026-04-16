@@ -1,0 +1,43 @@
+---
+# Task order maps to CUSTOMER-GUIDE.md Detailed Installation Steps (connected path).
+# Tags: contentiq_step1 … contentiq_step8, contentiq_prep, contentiq (all).
+
+- name: Normalize external inputs
+  ansible.builtin.include_tasks: 01_normalize_input.yml
+  tags: [contentiq, contentiq_prep]
+
+- name: Run preflight checks
+  ansible.builtin.include_tasks: 02_preflight.yml
+  tags: [contentiq, contentiq_prep]
+
+- name: "CUSTOMER-GUIDE Step 1: Create namespace"
+  ansible.builtin.include_tasks: 03_namespace.yml
+  tags: [contentiq, contentiq_step1]
+
+- name: "CUSTOMER-GUIDE Step 2: Configure image pull secrets"
+  ansible.builtin.include_tasks: 04_pull_secrets.yml
+  tags: [contentiq, contentiq_step2]
+
+- name: "CUSTOMER-GUIDE Step 3: Register operator catalog"
+  ansible.builtin.include_tasks: 05_olm_catalog.yml
+  tags: [contentiq, contentiq_step3]
+
+- name: "CUSTOMER-GUIDE Step 4: Install operator (subscription)"
+  ansible.builtin.include_tasks: 06_olm_subscription.yml
+  tags: [contentiq, contentiq_step4]
+
+- name: "CUSTOMER-GUIDE Step 5: Configure backend and RAG secrets"
+  ansible.builtin.include_tasks: 07_app_secrets.yml
+  tags: [contentiq, contentiq_step5]
+
+- name: "CUSTOMER-GUIDE Step 6: Deploy ContentIQ instance (CR)"
+  ansible.builtin.include_tasks: 08_contentiq_cr.yml
+  tags: [contentiq, contentiq_step6]
+
+- name: "CUSTOMER-GUIDE Step 7: Structured data post-steps (SCC, pgvector, pull links)"
+  ansible.builtin.include_tasks: 09_structured_data.yml
+  tags: [contentiq, contentiq_step7]
+
+- name: "CUSTOMER-GUIDE Step 8: Deployment validation"
+  ansible.builtin.include_tasks: 10_validation.yml
+  tags: [contentiq, contentiq_step8]

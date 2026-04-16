@@ -1,0 +1,219 @@
+---
+- name: Assert connected deployment mode
+  ansible.builtin.assert:
+    that:
+      - contentiq_install_deployment_mode == "connected"
+    fail_msg: >-
+      This Ansible deployment folder only implements connected-cluster
+      deployment. Image mirroring/disconnected mode is intentionally not
+      implemented here.
+
+- name: Create render directory
+  ansible.builtin.file:
+    path: "{{ contentiq_render_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: Verify oc CLI is available
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - version
+      - --client
+  register: contentiq_install_oc_version
+  changed_when: false
+
+- name: Verify current cluster login
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - whoami
+  register: contentiq_install_whoami
+  changed_when: false
+
+- name: Capture current cluster API server
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - whoami
+      - --show-server
+  register: contentiq_install_cluster_server
+  changed_when: false
+
+- name: Capture OpenShift application domain
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - ingress.config/cluster
+      - -o
+      - jsonpath={.spec.domain}
+  register: contentiq_install_cluster_domain_cmd
+  changed_when: false
+  failed_when: false
+
+- name: Store cluster metadata
+  ansible.builtin.set_fact:
+    contentiq_install_cluster_domain: "{{ contentiq_install_cluster_domain_cmd.stdout | default('') | trim }}"
+
+- name: Assert cluster domain is available when using auto-filled hostname placeholders
+  ansible.builtin.assert:
+    that:
+      - contentiq_install_cluster_domain | length > 0
+    fail_msg: >-
+      The playbook could not determine the OpenShift application domain from
+      ingress.config/cluster, so it cannot replace <your-cluster-domain> in the
+      configured route hostnames.
+  when:
+    - "'<your-cluster-domain>' in contentiq_routes.frontend_hostname or '<your-cluster-domain>' in contentiq_routes.backend_hostname"
+
+- name: Build effective route hostnames
+  ansible.builtin.set_fact:
+    contentiq_install_frontend_hostname: >-
+      {{
+        (contentiq_routes.frontend_hostname | replace('<your-cluster-domain>', contentiq_install_cluster_domain))
+        if contentiq_routes.frontend_hostname | length > 0
+        else ''
+      }}
+    contentiq_install_backend_hostname: >-
+      {{
+        (contentiq_routes.backend_hostname | replace('<your-cluster-domain>', contentiq_install_cluster_domain))
+        if contentiq_routes.backend_hostname | length > 0
+        else ''
+      }}
+
+- name: Compute route-derived secret values from effective hostnames
+  ansible.builtin.set_fact:
+    contentiq_install_frontend_url: >-
+      {{
+        'https://' ~ contentiq_install_frontend_hostname
+        if contentiq_install_frontend_hostname | length > 0
+        else ''
+      }}
+    contentiq_install_backend_url: >-
+      {{
+        'https://' ~ contentiq_install_backend_hostname
+        if contentiq_install_backend_hostname | length > 0
+        else ''
+      }}
+    contentiq_install_session_cookie_domain: >-
+      {{
+        contentiq_install_frontend_hostname | regex_replace('^[^.]+', '')
+        if contentiq_install_frontend_hostname | length > 0
+        else ''
+      }}
+  no_log: true
+
+- name: Apply effective route defaults to backend secret
+  ansible.builtin.set_fact:
+    contentiq_install_backend_secret_resolved: >-
+      {{
+        contentiq_install_backend_secret_resolved
+        | combine(
+            (
+              {
+                'FRONTEND_URL': contentiq_install_frontend_url,
+                'CORS_ALLOWED_ORIGINS': contentiq_install_frontend_url,
+                'SESSION_COOKIE_DOMAIN': contentiq_install_session_cookie_domain
+              }
+              if (
+                contentiq_auto_compute_route_settings | bool
+                and contentiq_install_frontend_url | length > 0
+              )
+              else {}
+            ),
+            recursive=True
+          )
+        | combine(
+            (
+              {
+                'MICROSOFT_REDIRECT_URI': contentiq_install_backend_url ~ '/api/connections/microsoft/auth/microsoft/callback'
+              }
+              if (
+                contentiq_auto_compute_route_settings | bool
+                and contentiq_install_backend_url | length > 0
+              )
+              else {}
+            ),
+            recursive=True
+          )
+        | combine(
+            (
+              {
+                'GOOGLE_REDIRECT_URI': contentiq_install_backend_url ~ '/api/connections/googledrive/auth/google/callback',
+                'BOX_REDIRECT_URI': contentiq_install_backend_url ~ '/api/connections/box/auth/box/callback'
+              }
+              if (
+                contentiq_auto_compute_oauth_redirects | bool
+                and contentiq_install_backend_url | length > 0
+              )
+              else {}
+            ),
+            recursive=True
+          )
+      }}
+  no_log: true
+
+- name: Assert required registry values when pull-secret management is enabled
+  ansible.builtin.assert:
+    that:
+      - contentiq_install_registry.server | length > 0
+      - contentiq_install_registry.username | length > 0
+      - contentiq_install_registry.password | length > 0
+      - contentiq_install_registry.email | length > 0
+    fail_msg: >-
+      Pull-secret management is enabled, but the effective registry credentials
+      are incomplete. Set contentiq_registry values directly or provide the
+      corresponding *_command values.
+  when: contentiq_manage_pull_secret | bool
+  no_log: true
+
+- name: Assert backend secret payload was resolved
+  ansible.builtin.assert:
+    that:
+      - contentiq_install_backend_secret_resolved | length > 0
+    fail_msg: >-
+      Backend secret data is empty. Provide contentiq_backend_secret directly or
+      via contentiq_backend_secret_file / contentiq_backend_secret_command.
+  no_log: true
+
+- name: Assert RAG secret payload was resolved
+  ansible.builtin.assert:
+    that:
+      - contentiq_install_rag_secret_resolved | length > 0
+    fail_msg: >-
+      RAG secret data is empty. Provide contentiq_rag_secret directly or via
+      contentiq_rag_secret_file / contentiq_rag_secret_command.
+  no_log: true
+
+- name: Assert required backend secret keys are present
+  ansible.builtin.assert:
+    that:
+      - (contentiq_backend_secret_required_keys | difference(contentiq_install_backend_secret_resolved.keys() | list)) | length == 0
+    fail_msg: >-
+      Missing required backend secret keys:
+      {{ contentiq_backend_secret_required_keys | difference(contentiq_install_backend_secret_resolved.keys() | list) | join(', ') }}
+  no_log: true
+
+- name: Assert required RAG secret keys are present
+  ansible.builtin.assert:
+    that:
+      - (contentiq_rag_secret_required_keys | difference(contentiq_install_rag_secret_resolved.keys() | list)) | length == 0
+    fail_msg: >-
+      Missing required RAG secret keys:
+      {{ contentiq_rag_secret_required_keys | difference(contentiq_install_rag_secret_resolved.keys() | list) | join(', ') }}
+  no_log: true
+
+- name: Assert custom hostnames when explicitly required (template CR mode only)
+  ansible.builtin.assert:
+    that:
+      - contentiq_install_frontend_hostname | length > 0
+      - contentiq_install_backend_hostname | length > 0
+    fail_msg: >-
+      Custom route hostnames are required for this deployment but were not
+      provided in contentiq_routes.frontend_hostname and
+      contentiq_routes.backend_hostname. If you use contentiq_contentiq_cr_apply_mode=bundle,
+      set contentiq_require_custom_hostnames to false or fill contentiq_routes for secret URL injection.
+  when:
+    - contentiq_require_custom_hostnames | bool
+    - contentiq_contentiq_cr_apply_mode == 'template'

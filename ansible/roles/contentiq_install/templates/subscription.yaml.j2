@@ -1,0 +1,14 @@
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: contentiq
+  namespace: openshift-operators
+spec:
+  channel: {{ contentiq_subscription.channel | quote }}
+  name: contentiq-operator
+  source: {{ contentiq_catalogsource_name | quote }}
+  sourceNamespace: {{ contentiq_catalogsource_namespace | quote }}
+  installPlanApproval: {{ contentiq_subscription.install_plan_approval }}
+  config:
+    resources:
+{{ contentiq_subscription.resources | to_nice_yaml(indent=2) | indent(6, true) }}

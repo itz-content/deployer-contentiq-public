@@ -1,0 +1,34 @@
+---
+# CUSTOMER-GUIDE.md — Step 1: Create Namespace (`oc apply -f 00-namespace.yaml`)
+
+- name: Apply namespace from deployment bundle
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - apply
+      - -f
+      - "{{ contentiq_bundle_manifest_namespace }}"
+  register: contentiq_install_namespace_apply
+  changed_when: >-
+    'created' in contentiq_install_namespace_apply.stdout
+    or 'configured' in contentiq_install_namespace_apply.stdout
+  when: contentiq_namespace_apply_mode == 'bundle'
+
+- name: Apply target namespace (inline fallback)
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - apply
+      - -f
+      - "-"
+  args:
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: {{ contentiq_namespace }}
+  register: contentiq_install_namespace_apply
+  changed_when: >-
+    'created' in contentiq_install_namespace_apply.stdout
+    or 'configured' in contentiq_install_namespace_apply.stdout
+  when: contentiq_namespace_apply_mode == 'inline'

@@ -1,0 +1,206 @@
+---
+# CUSTOMER-GUIDE.md — Step 8: Deployment health (rollouts, routes, optional summary)
+
+- name: Wait for core ContentIQ deployments to become available
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - rollout
+      - status
+      - "deployment/{{ item }}"
+      - -n
+      - "{{ contentiq_namespace }}"
+      - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
+  loop:
+    - contentiq-backend
+    - contentiq-frontend
+    - personalization-rag
+  register: contentiq_install_rollout_status
+  changed_when: false
+
+- name: Wait for frontend route host
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - route
+      - contentiq-frontend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.spec.host}
+  register: contentiq_install_frontend_route_cmd
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_install_frontend_route_cmd.stdout | trim | length > 0
+  when: contentiq_validation.wait_for_routes | bool
+
+- name: Wait for backend route host
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - route
+      - contentiq-backend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.spec.host}
+  register: contentiq_install_backend_route_cmd
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_install_backend_route_cmd.stdout | trim | length > 0
+  when: contentiq_validation.wait_for_routes | bool
+
+- name: Store effective route hosts
+  ansible.builtin.set_fact:
+    contentiq_install_frontend_route_host: "{{ contentiq_install_frontend_route_cmd.stdout | default('') | trim }}"
+    contentiq_install_backend_route_host: "{{ contentiq_install_backend_route_cmd.stdout | default('') | trim }}"
+  when: contentiq_validation.wait_for_routes | bool
+
+- name: Align backend secret to actual route hosts when required
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - patch
+      - secret
+      - "{{ contentiq_backend_secret_name }}"
+      - -n
+      - "{{ contentiq_namespace }}"
+      - --type=merge
+      - -p
+      - "{{ {'stringData': contentiq_install_backend_route_secret_patch} | to_json }}"
+  vars:
+    contentiq_install_backend_route_secret_patch:
+      FRONTEND_URL: "https://{{ contentiq_install_frontend_route_host }}"
+      CORS_ALLOWED_ORIGINS: "https://{{ contentiq_install_frontend_route_host }}"
+      SESSION_COOKIE_DOMAIN: "{{ contentiq_install_frontend_route_host | regex_replace('^[^.]+', '') }}"
+      MICROSOFT_REDIRECT_URI: "https://{{ contentiq_install_backend_route_host }}/api/connections/microsoft/auth/microsoft/callback"
+      GOOGLE_REDIRECT_URI: >-
+        {{
+          'https://' ~ contentiq_install_backend_route_host ~ '/api/connections/googledrive/auth/google/callback'
+          if contentiq_auto_compute_oauth_redirects | bool
+          else omit
+        }}
+      BOX_REDIRECT_URI: >-
+        {{
+          'https://' ~ contentiq_install_backend_route_host ~ '/api/connections/box/auth/box/callback'
+          if contentiq_auto_compute_oauth_redirects | bool
+          else omit
+        }}
+  register: contentiq_install_backend_route_secret_patch_cmd
+  changed_when: true
+  when:
+    - contentiq_validation.wait_for_routes | bool
+    - contentiq_align_backend_secret_after_routes | bool
+      or contentiq_routes.frontend_hostname | length == 0
+      or contentiq_routes.backend_hostname | length == 0
+  no_log: true
+
+- name: Restart backend deployment after route-based secret alignment
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - rollout
+      - restart
+      - deployment/contentiq-backend
+      - -n
+      - "{{ contentiq_namespace }}"
+  register: contentiq_install_backend_restart_after_alignment
+  changed_when: "'restarted' in contentiq_install_backend_restart_after_alignment.stdout"
+  when:
+    - contentiq_validation.wait_for_routes | bool
+    - contentiq_align_backend_secret_after_routes | bool
+      or contentiq_routes.frontend_hostname | length == 0
+      or contentiq_routes.backend_hostname | length == 0
+
+- name: Wait for backend rollout after route-based secret alignment
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - rollout
+      - status
+      - deployment/contentiq-backend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
+  changed_when: false
+  when:
+    - contentiq_validation.wait_for_routes | bool
+    - contentiq_align_backend_secret_after_routes | bool
+      or contentiq_routes.frontend_hostname | length == 0
+      or contentiq_routes.backend_hostname | length == 0
+
+- name: Check backend health endpoint
+  ansible.builtin.uri:
+    url: "https://{{ contentiq_install_backend_route_host }}/api/support/health"
+    method: GET
+    validate_certs: false
+    status_code: 200
+  when:
+    - contentiq_validation.check_health_endpoints | bool
+    - contentiq_install_backend_route_host | default('') | length > 0
+
+- name: Check frontend root endpoint
+  ansible.builtin.uri:
+    url: "https://{{ contentiq_install_frontend_route_host }}/"
+    method: GET
+    validate_certs: false
+    status_code: 200
+  when:
+    - contentiq_validation.check_health_endpoints | bool
+    - contentiq_install_frontend_route_host | default('') | length > 0
+
+- name: Capture current pod summary
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - pods
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - wide
+  register: contentiq_install_pod_summary
+  changed_when: false
+
+- name: Write deployment summary JSON
+  ansible.builtin.copy:
+    dest: "{{ contentiq_render_dir }}/contentiq-install-output.json"
+    mode: "0600"
+    content: |
+      {{
+        {
+          'namespace': contentiq_namespace,
+          'cluster_domain': contentiq_install_cluster_domain | default(''),
+          'cluster_server': contentiq_install_cluster_server.stdout | default(''),
+          'installed_csv': contentiq_install_installed_csv | default(''),
+          'custom_resource': contentiq_custom_resource_name,
+          'frontend_url': ('https://' ~ contentiq_install_frontend_route_host) if (contentiq_install_frontend_route_host | default('') | length > 0) else '',
+          'backend_url': ('https://' ~ contentiq_install_backend_route_host) if (contentiq_install_backend_route_host | default('') | length > 0) else '',
+          'pod_summary': contentiq_install_pod_summary.stdout_lines | default([])
+        } | to_nice_json
+      }}
+  when: contentiq_validation.output_summary | bool
+
+- name: Write deployment summary text
+  ansible.builtin.copy:
+    dest: "{{ contentiq_render_dir }}/contentiq-install-output.txt"
+    mode: "0600"
+    content: |
+      Namespace: {{ contentiq_namespace }}
+      Cluster Server: {{ contentiq_install_cluster_server.stdout | default('') }}
+      Cluster Domain: {{ contentiq_install_cluster_domain | default('') }}
+      Installed CSV: {{ contentiq_install_installed_csv | default('') }}
+      Frontend URL: {{ ('https://' ~ contentiq_install_frontend_route_host) if (contentiq_install_frontend_route_host | default('') | length > 0) else '' }}
+      Backend URL: {{ ('https://' ~ contentiq_install_backend_route_host) if (contentiq_install_backend_route_host | default('') | length > 0) else '' }}
+  when: contentiq_validation.output_summary | bool
+
+- name: Print deployment summary
+  ansible.builtin.debug:
+    msg:
+      - "Frontend URL: {{ ('https://' ~ contentiq_install_frontend_route_host) if (contentiq_install_frontend_route_host | default('') | length > 0) else 'not available' }}"
+      - "Backend URL: {{ ('https://' ~ contentiq_install_backend_route_host) if (contentiq_install_backend_route_host | default('') | length > 0) else 'not available' }}"
+      - "Summary JSON: {{ contentiq_render_dir }}/contentiq-install-output.json"

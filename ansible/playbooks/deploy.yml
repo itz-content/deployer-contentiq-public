@@ -1,0 +1,1224 @@
+---
+- name: ContentIQ happy-path installation
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # Core CLI/runtime settings
+    contentiq_oc_binary: "oc"
+    contentiq_wait_delay_seconds: 10
+    # Ansible until loops: high retry count so we only advance when the condition is true (READY, Succeeded, etc.).
+    contentiq_wait_retries: 2147483647
+    # oc rollout status --timeout: backend/RAG cold starts and image pulls often exceed a few minutes.
+    # With 0s, many oc versions treat the deadline as immediate and fail while pods are still Pending.
+    contentiq_rollout_timeout_seconds: 14400
+    # Deployments default to progressDeadlineSeconds=600 (10m). We patch to at least this before every
+    # rollout wait (including Step 6b after route alignment) so the controller does not fail first.
+    contentiq_min_progress_deadline_seconds: 14400
+    contentiq_apply_min_progress_deadline: true
+
+    # Step 4: OLM installs the operator into openshift-operators; deleting stale pods forces a new
+    # reconcile (avoids long CSV/Installing stalls). Applies even when pull-secret tasks are skipped.
+    contentiq_step4_restart_operator_pod: true
+    contentiq_step4_wait_operator_rollout: true
+    contentiq_operator_deployment_name: contentiq-operator-controller-manager
+    # Before Step 4 subscription: optional actions to free node RAM on small clusters (e.g. CRC).
+    # Set prepare true and list namespaces / deployments you can safely trim; empty lists skip those actions.
+    contentiq_step4_prepare_node_memory: false
+    contentiq_step4_prune_succeeded_all_namespaces: false
+    contentiq_step4_prune_succeeded_namespaces: []
+    contentiq_step4_scale_down_deployments: []
+    contentiq_step4_prepare_pause_seconds: 0
+
+    # Base paths: all manifests and secrets live under ansible/ (playbook_dir/../)
+    contentiq_root_dir: "{{ playbook_dir | dirname }}"
+    contentiq_namespace: "contentiq"
+
+    contentiq_namespace_manifest: "{{ contentiq_root_dir }}/manifests/00-namespace.yaml"
+    contentiq_catalogsource_manifest: "{{ contentiq_root_dir }}/manifests/02-catalogsource.yaml"
+    contentiq_subscription_manifest: "{{ contentiq_root_dir }}/manifests/03-subscription.yaml"
+    contentiq_cr_manifest: "{{ contentiq_root_dir }}/manifests/contentiq-custom-resource.yaml"
+
+    # Secrets (use the backend template directly; no dynamic template rendering)
+    contentiq_backend_secret_manifest: "{{ contentiq_root_dir }}/secrets/backend-secrets-template.yaml"
+    # RAG pods require Secret personalization-api-secrets; apply the template in Step 5b (same as CUSTOMER-GUIDE).
+    contentiq_apply_rag_secret: true
+    contentiq_rag_secret_manifest: "{{ contentiq_root_dir }}/secrets/rag-secrets-template.yaml"
+
+    # Pull secret inputs (dynamic, user supplied via -e @parameters.yml or -e vars)
+    contentiq_manage_pull_secret: true
+    contentiq_pull_secret_name: "dockerhub-pull"
+    contentiq_registry_server: "https://index.docker.io/v1/"
+    contentiq_registry_username: ""
+    contentiq_registry_password: ""
+    contentiq_registry_email: ""
+
+    # Step 7 post-deploy (SCC, Postgres wait before Lakekeeper rollout, pgvector, pull-secret links).
+    contentiq_enable_structured_data_poststeps: true
+    contentiq_enable_pgvector: true
+    contentiq_link_default_pull_secret_for_structured_data: true
+
+    # When true: skip phase-2 rollout waits (edge/lakekeeper/trino) and skip Step 7 — for very small clusters (e.g. CRC).
+    # Default false: complete Step 6 phase-2 waits and Step 7 in one playbook run.
+    contentiq_defer_phase2_and_structured_poststeps: false
+
+    # Step 7a (runs before phase-2 rollout waits): unblock SCC + CNPG webhook so Lakekeeper/Trino can schedule.
+    contentiq_step7_wait_cnpg_webhook_cert: true
+    # If cnpg-webhook-cert exists but lacks data.ca.crt (CNPG sometimes omits it), copy from cnpg-ca-secret — CUSTOMER-GUIDE.md
+    contentiq_step7_ensure_cnpg_webhook_ca_from_ca_secret: true
+    # Set true to delete job/lakekeeper-db-migration-1 so the operator can re-run DB migrations (e.g. after DB wipe).
+    contentiq_delete_lakekeeper_migration_job: false
+
+    # After the ContentIQ CR is applied, the operator still reconciles all operands in one pass; these
+    # settings only sequence *readiness* checks: core app first, then structured-data workloads.
+    contentiq_enable_phased_rollout: true
+    # Backend expects in-cluster Redis unless spec.redis.mode=external (set false when using external Redis).
+    contentiq_rollout_wait_redis: true
+    contentiq_rollout_phase1_deployments:
+      - contentiq-backend
+      - personalization-rag
+      - contentiq-frontend
+    # Lakehouse edge + Trino. Skipped when contentiq_rollout_wait_phase2 is false or when phase-2 is deferred.
+    contentiq_rollout_wait_phase2: true
+    contentiq_rollout_phase2_deployments:
+      - edge-auth-proxy
+      - edge-gateway
+      - lakekeeper
+      - trino-coordinator
+      - trino-worker
+    # Small clusters (e.g. CRC): optional pauses so rollouts are not back-to-back while memory is tight.
+    # Set non-zero values in parameters.yml — e.g. 30–90 between deployments, 60–120 before phase 2.
+    contentiq_rollout_pause_between_deployments_seconds: 0
+    contentiq_rollout_pause_after_redis_seconds: 0
+    contentiq_rollout_pause_before_phase2_seconds: 0
+    contentiq_rollout_legacy_deployments:
+      - contentiq-backend
+      - contentiq-frontend
+      - personalization-rag
+
+    # Route URLs / hostnames: deploy.yml reads ingress.config/cluster (OpenShift apps domain) and fills
+    # __CONTENTIQ_*__ placeholders in secrets + CR before oc apply. Override labels if your DNS names differ.
+    contentiq_auto_route_hostnames: true
+    contentiq_route_frontend_label: "contentiq-symplistic-ai"
+    contentiq_route_backend_label: "api-contentiq-symplistic-ai"
+    contentiq_render_dir: "{{ contentiq_root_dir }}/.rendered"
+
+    # After Routes exist: align contentiq-backend-secrets to live Route hosts (CUSTOMER-GUIDE oc patch flow).
+    contentiq_align_backend_secret_to_live_routes: true
+    contentiq_align_backend_oauth_redirects: true
+    contentiq_step6b_wait_backend_rollout_after_align: true
+
+  tasks:
+    - name: Verify oc client is available
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - version
+          - --client
+      changed_when: false
+
+    - name: Verify current OpenShift login
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - whoami
+      changed_when: false
+
+    - name: Assert pull secret inputs are provided when enabled
+      ansible.builtin.assert:
+        that:
+          - contentiq_registry_username | length > 0
+          - contentiq_registry_password | length > 0
+          - contentiq_registry_email | length > 0
+        fail_msg: >-
+          Pull-secret management is enabled, but registry credentials are missing.
+          Set contentiq_registry_username/contentiq_registry_password/contentiq_registry_email
+          in parameters.yml or pass them via -e.
+      when: contentiq_manage_pull_secret | bool
+      no_log: true
+
+    - name: "Step 1: Create namespace"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - apply
+          - -f
+          - "{{ contentiq_namespace_manifest }}"
+      register: contentiq_step1_namespace_apply
+      changed_when: >-
+        'created' in contentiq_step1_namespace_apply.stdout
+        or 'configured' in contentiq_step1_namespace_apply.stdout
+
+    - name: "Step 2: Create pull secrets in required namespaces"
+      ansible.builtin.shell: >-
+        set -o pipefail &&
+        {{ contentiq_oc_binary }} create secret docker-registry {{ contentiq_pull_secret_name }}
+        --docker-server="{{ contentiq_registry_server }}"
+        --docker-username="{{ contentiq_registry_username }}"
+        --docker-password="{{ contentiq_registry_password }}"
+        --docker-email="{{ contentiq_registry_email }}"
+        -n {{ item }}
+        --dry-run=client -o yaml | {{ contentiq_oc_binary }} apply -f -
+      args:
+        executable: /bin/bash
+      loop:
+        - openshift-marketplace
+        - openshift-operators
+        - "{{ contentiq_namespace }}"
+      register: contentiq_step2_pull_secret_apply
+      changed_when: >-
+        'created' in contentiq_step2_pull_secret_apply.stdout
+        or 'configured' in contentiq_step2_pull_secret_apply.stdout
+      when: contentiq_manage_pull_secret | bool
+      no_log: true
+
+    - name: "Step 2: Link pull secret to default service accounts"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - secrets
+          - link
+          - default
+          - "{{ contentiq_pull_secret_name }}"
+          - --for=pull
+          - -n
+          - "{{ item }}"
+      loop:
+        - openshift-marketplace
+        - openshift-operators
+        - "{{ contentiq_namespace }}"
+      changed_when: false
+      when: contentiq_manage_pull_secret | bool
+
+    - name: "Step 3: Apply CatalogSource"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - apply
+          - -f
+          - "{{ contentiq_catalogsource_manifest }}"
+      register: contentiq_step3_catalog_apply
+      changed_when: >-
+        'created' in contentiq_step3_catalog_apply.stdout
+        or 'configured' in contentiq_step3_catalog_apply.stdout
+
+    - name: "Step 3: Wait for catalog service account"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - serviceaccount
+          - contentiq-operators
+          - -n
+          - openshift-marketplace
+      register: contentiq_step3_catalog_sa_wait
+      changed_when: false
+      retries: "{{ contentiq_wait_retries }}"
+      delay: "{{ contentiq_wait_delay_seconds }}"
+      until: contentiq_step3_catalog_sa_wait.rc == 0
+      when: contentiq_manage_pull_secret | bool
+
+    - name: "Step 3: Link pull secret to catalog service accounts"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - secrets
+          - link
+          - "{{ item }}"
+          - "{{ contentiq_pull_secret_name }}"
+          - --for=pull
+          - -n
+          - openshift-marketplace
+      loop:
+        - contentiq-operators
+        - default
+      changed_when: false
+      when: contentiq_manage_pull_secret | bool
+
+    - name: "Step 3: Restart catalog pod to pick up pull secret"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - delete
+          - pod
+          - -l
+          - olm.catalogSource=contentiq-operators
+          - -n
+          - openshift-marketplace
+          - --ignore-not-found
+      register: contentiq_step3_catalog_pod_restart
+      changed_when: "'deleted' in contentiq_step3_catalog_pod_restart.stdout"
+
+    - name: "Step 3: Wait for CatalogSource READY"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - catalogsource
+          - contentiq-operators
+          - -n
+          - openshift-marketplace
+          - -o
+          - jsonpath={.status.connectionState.lastObservedState}
+      register: contentiq_step3_catalog_ready
+      changed_when: false
+      retries: "{{ contentiq_wait_retries }}"
+      delay: "{{ contentiq_wait_delay_seconds }}"
+      until: contentiq_step3_catalog_ready.stdout == "READY"
+
+    - name: "Step 4 pre: Delete Succeeded pods (all namespaces)"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - delete
+          - pod
+          - --all-namespaces
+          - --field-selector=status.phase=Succeeded
+      register: contentiq_step4_pre_prune_all
+      failed_when: false
+      changed_when: "'deleted' in contentiq_step4_pre_prune_all.stdout | default('')"
+      when:
+        - contentiq_step4_prepare_node_memory | bool
+        - contentiq_step4_prune_succeeded_all_namespaces | bool
+
+    - name: "Step 4 pre: Delete Succeeded pods in selected namespaces"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - delete
+          - pod
+          - -n
+          - "{{ item }}"
+          - --field-selector=status.phase=Succeeded
+      loop: "{{ contentiq_step4_prune_succeeded_namespaces }}"
+      register: contentiq_step4_pre_prune_ns
+      failed_when: false
+      changed_when: "'deleted' in (contentiq_step4_pre_prune_ns.results | default([]) | map(attribute='stdout') | join(' '))"
+      when:
+        - contentiq_step4_prepare_node_memory | bool
+        - (contentiq_step4_prune_succeeded_namespaces | length) > 0
+
+    - name: "Step 4 pre: Scale down optional deployments (stops running pods to free RAM)"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - scale
+          - "deployment/{{ item.deployment }}"
+          - -n
+          - "{{ item.namespace }}"
+          - --replicas=0
+      loop: "{{ contentiq_step4_scale_down_deployments }}"
+      register: contentiq_step4_pre_scale
+      failed_when: false
+      changed_when: "'scaled' in (contentiq_step4_pre_scale.results | default([]) | map(attribute='stdout') | join(' '))"
+      when:
+        - contentiq_step4_prepare_node_memory | bool
+        - (contentiq_step4_scale_down_deployments | length) > 0
+
+    - name: "Step 4 pre: Pause for kubelet to reclaim memory after prune/scale"
+      ansible.builtin.pause:
+        seconds: "{{ contentiq_step4_prepare_pause_seconds | int }}"
+      when:
+        - contentiq_step4_prepare_node_memory | bool
+        - (contentiq_step4_prepare_pause_seconds | int) > 0
+
+    - name: "Step 4: Apply operator Subscription"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - apply
+          - -f
+          - "{{ contentiq_subscription_manifest }}"
+      register: contentiq_step4_subscription_apply
+      changed_when: >-
+        'created' in contentiq_step4_subscription_apply.stdout
+        or 'configured' in contentiq_step4_subscription_apply.stdout
+
+    - name: "Step 4: Delete existing ContentIQ operator pods (fresh reconcile)"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - delete
+          - pod
+          - -n
+          - openshift-operators
+          - -l
+          - app.kubernetes.io/name=contentiq-operator
+          - --ignore-not-found
+      register: contentiq_step4_operator_pod_delete_after_sub
+      changed_when: "'deleted' in contentiq_step4_operator_pod_delete_after_sub.stdout"
+      when: contentiq_step4_restart_operator_pod | bool
+
+    - name: "Step 4: Wait for operator service account"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - serviceaccount
+          - contentiq-operator-controller-manager
+          - -n
+          - openshift-operators
+      register: contentiq_step4_operator_sa_wait
+      changed_when: false
+      retries: "{{ contentiq_wait_retries }}"
+      delay: "{{ contentiq_wait_delay_seconds }}"
+      until: contentiq_step4_operator_sa_wait.rc == 0
+      when: contentiq_manage_pull_secret | bool
+
+    - name: "Step 4: Link pull secret to operator service account"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - secrets
+          - link
+          - contentiq-operator-controller-manager
+          - "{{ contentiq_pull_secret_name }}"
+          - --for=pull
+          - -n
+          - openshift-operators
+      changed_when: false
+      when: contentiq_manage_pull_secret | bool
+
+    - name: "Step 4: Restart operator pods after pull-secret link"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - delete
+          - pod
+          - -n
+          - openshift-operators
+          - -l
+          - app.kubernetes.io/name=contentiq-operator
+          - --ignore-not-found
+      register: contentiq_step4_operator_pod_restart
+      changed_when: "'deleted' in contentiq_step4_operator_pod_restart.stdout"
+      when: contentiq_manage_pull_secret | bool
+
+    - name: "Step 4: Wait for subscription installed CSV"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - subscription
+          - contentiq
+          - -n
+          - openshift-operators
+          - -o
+          - jsonpath={.status.installedCSV}
+      register: contentiq_step4_installed_csv_cmd
+      changed_when: false
+      retries: "{{ contentiq_wait_retries }}"
+      delay: "{{ contentiq_wait_delay_seconds }}"
+      until: contentiq_step4_installed_csv_cmd.stdout | trim | length > 0
+
+    - name: Set installed CSV name
+      ansible.builtin.set_fact:
+        contentiq_installed_csv: "{{ contentiq_step4_installed_csv_cmd.stdout | trim }}"
+
+    - name: "Step 4: Wait for operator controller-manager deployment to exist"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - deployment
+          - "{{ contentiq_operator_deployment_name }}"
+          - -n
+          - openshift-operators
+      register: contentiq_step4_operator_dep_wait
+      changed_when: false
+      retries: "{{ contentiq_wait_retries }}"
+      delay: "{{ contentiq_wait_delay_seconds }}"
+      until: contentiq_step4_operator_dep_wait.rc == 0
+      when: contentiq_step4_wait_operator_rollout | bool
+
+    - name: "Step 4: Ensure operator deployment progress deadline before rollout wait"
+      ansible.builtin.include_tasks: "{{ playbook_dir | dirname }}/roles/contentiq_install/tasks/patch_deployment_min_progress_deadline.yml"
+      vars:
+        patch_dep_name: "{{ contentiq_operator_deployment_name }}"
+        patch_dep_namespace: openshift-operators
+      when: contentiq_step4_wait_operator_rollout | bool
+
+    - name: "Step 4: Wait for operator controller-manager deployment rollout"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - rollout
+          - status
+          - "deployment/{{ contentiq_operator_deployment_name }}"
+          - -n
+          - openshift-operators
+          - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
+      changed_when: false
+      when: contentiq_step4_wait_operator_rollout | bool
+
+    - name: "Step 4: Wait for installed CSV to Succeeded"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - csv
+          - "{{ contentiq_installed_csv }}"
+          - -n
+          - openshift-operators
+          - -o
+          - jsonpath={.status.phase}
+      register: contentiq_step4_csv_phase
+      changed_when: false
+      retries: "{{ contentiq_wait_retries }}"
+      delay: "{{ contentiq_wait_delay_seconds }}"
+      until: contentiq_step4_csv_phase.stdout == "Succeeded"
+
+    - name: "Step 4: Wait for ContentIQ CRD"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - crd
+          - contentiqs.contentiq.symplistic.ai
+      register: contentiq_step4_crd_wait
+      changed_when: false
+      retries: "{{ contentiq_wait_retries }}"
+      delay: "{{ contentiq_wait_delay_seconds }}"
+      until: contentiq_step4_crd_wait.rc == 0
+
+    - name: Ensure local render directory for route-resolved manifests
+      ansible.builtin.file:
+        path: "{{ contentiq_render_dir }}"
+        state: directory
+        mode: "0700"
+      when: contentiq_auto_route_hostnames | bool
+
+    - name: Capture OpenShift ingress application domain
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - ingress.config/cluster
+          - -o
+          - jsonpath={.spec.domain}
+      register: contentiq_apps_domain_cmd
+      changed_when: false
+      when: contentiq_auto_route_hostnames | bool
+
+    - name: Assert ingress application domain is available for route auto-fill
+      ansible.builtin.assert:
+        that:
+          - (contentiq_apps_domain_cmd.stdout | default('') | trim | length) > 0
+        fail_msg: >-
+          Could not read spec.domain from ingress.config/cluster. Log in to an OpenShift cluster
+          where this resource exists, or set contentiq_auto_route_hostnames: false and replace
+          __CONTENTIQ_*__ placeholders in your manifests by hand.
+      when: contentiq_auto_route_hostnames | bool
+
+    - name: Compute route hostnames from apps domain and labels
+      ansible.builtin.set_fact:
+        contentiq_apps_domain: "{{ contentiq_apps_domain_cmd.stdout | trim }}"
+        contentiq_route_frontend_host: "{{ contentiq_route_frontend_label }}.{{ contentiq_apps_domain_cmd.stdout | trim }}"
+        contentiq_route_backend_host: "{{ contentiq_route_backend_label }}.{{ contentiq_apps_domain_cmd.stdout | trim }}"
+      when: contentiq_auto_route_hostnames | bool
+
+    - name: Compute URL-derived secret values (match CUSTOMER-GUIDE route alignment)
+      ansible.builtin.set_fact:
+        contentiq_derived_frontend_url: "https://{{ contentiq_route_frontend_host }}"
+        contentiq_derived_backend_url: "https://{{ contentiq_route_backend_host }}"
+        contentiq_derived_session_cookie_domain: "{{ contentiq_route_frontend_host | regex_replace('^[^.]+', '') }}"
+        contentiq_derived_microsoft_redirect: "{{ ('https://' ~ contentiq_route_backend_host) ~ '/api/connections/microsoft/auth/microsoft/callback' }}"
+        contentiq_derived_box_redirect: "{{ ('https://' ~ contentiq_route_backend_host) ~ '/api/connections/box/auth/box/callback' }}"
+        contentiq_derived_google_redirect: "{{ ('https://' ~ contentiq_route_backend_host) ~ '/api/connections/googledrive/auth/google/callback' }}"
+      when: contentiq_auto_route_hostnames | bool
+
+    - name: Copy backend secret manifest for placeholder substitution
+      ansible.builtin.copy:
+        src: "{{ contentiq_backend_secret_manifest }}"
+        dest: "{{ contentiq_render_dir }}/backend-secrets-rendered.yaml"
+        mode: "0600"
+      when: contentiq_auto_route_hostnames | bool
+      no_log: true
+
+    # Two passes: ansible.builtin.replace has no replace_all in Ansible 13+ (shared FRONTEND + CORS keys).
+    - name: Substitute FRONTEND_URL and CORS (shared placeholder) in rendered backend secret
+      ansible.builtin.replace:
+        path: "{{ contentiq_render_dir }}/backend-secrets-rendered.yaml"
+        regexp: '__CONTENTIQ_FRONTEND_URL__'
+        replace: "{{ contentiq_derived_frontend_url }}"
+      loop: [1, 2]
+      when: contentiq_auto_route_hostnames | bool
+      no_log: true
+
+    - name: Substitute remaining route-derived keys in rendered backend secret
+      ansible.builtin.replace:
+        path: "{{ contentiq_render_dir }}/backend-secrets-rendered.yaml"
+        regexp: "{{ item.regexp }}"
+        replace: "{{ item.replace }}"
+      loop:
+        - { regexp: '__CONTENTIQ_SESSION_COOKIE_DOMAIN__', replace: "{{ contentiq_derived_session_cookie_domain }}" }
+        - { regexp: '__CONTENTIQ_MICROSOFT_REDIRECT_URI__', replace: "{{ contentiq_derived_microsoft_redirect }}" }
+        - { regexp: '__CONTENTIQ_BOX_REDIRECT_URI__', replace: "{{ contentiq_derived_box_redirect }}" }
+        - { regexp: '__CONTENTIQ_GOOGLE_REDIRECT_URI__', replace: "{{ contentiq_derived_google_redirect }}" }
+      when: contentiq_auto_route_hostnames | bool
+      no_log: true
+
+    - name: Copy ContentIQ CR manifest for placeholder substitution
+      ansible.builtin.copy:
+        src: "{{ contentiq_cr_manifest }}"
+        dest: "{{ contentiq_render_dir }}/contentiq-cr-rendered.yaml"
+        mode: "0644"
+      when: contentiq_auto_route_hostnames | bool
+
+    - name: Substitute route hostnames into rendered ContentIQ CR
+      ansible.builtin.replace:
+        path: "{{ contentiq_render_dir }}/contentiq-cr-rendered.yaml"
+        regexp: "__CONTENTIQ_ROUTE_FRONTEND_HOST__"
+        replace: "{{ contentiq_route_frontend_host }}"
+      when: contentiq_auto_route_hostnames | bool
+
+    - name: Substitute backend route hostname into rendered ContentIQ CR
+      ansible.builtin.replace:
+        path: "{{ contentiq_render_dir }}/contentiq-cr-rendered.yaml"
+        regexp: "__CONTENTIQ_ROUTE_BACKEND_HOST__"
+        replace: "{{ contentiq_route_backend_host }}"
+      when: contentiq_auto_route_hostnames | bool
+
+    - name: Select effective manifest paths for this run
+      ansible.builtin.set_fact:
+        contentiq_effective_backend_secret_manifest: >-
+          {{
+            (contentiq_render_dir ~ '/backend-secrets-rendered.yaml')
+            if (contentiq_auto_route_hostnames | bool)
+            else contentiq_backend_secret_manifest
+          }}
+        contentiq_effective_cr_manifest: >-
+          {{
+            (contentiq_render_dir ~ '/contentiq-cr-rendered.yaml')
+            if (contentiq_auto_route_hostnames | bool)
+            else contentiq_cr_manifest
+          }}
+
+    - name: Refuse apply with unfilled route placeholders when auto hostnames are disabled
+      ansible.builtin.assert:
+        that:
+          - lookup('file', contentiq_backend_secret_manifest) is not search('__CONTENTIQ_')
+          - lookup('file', contentiq_cr_manifest) is not search('__CONTENTIQ_')
+        fail_msg: >-
+          Route placeholders __CONTENTIQ_*__ are still present but contentiq_auto_route_hostnames is false.
+          Set contentiq_auto_route_hostnames: true (recommended) or replace placeholders with real values.
+      when: not (contentiq_auto_route_hostnames | bool)
+
+    - name: "Step 5: Apply backend secret manifest"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - apply
+          - -f
+          - "{{ contentiq_effective_backend_secret_manifest }}"
+      register: contentiq_step5_backend_secret_apply
+      changed_when: >-
+        'created' in contentiq_step5_backend_secret_apply.stdout
+        or 'configured' in contentiq_step5_backend_secret_apply.stdout
+      no_log: true
+
+    - name: "Step 5b: Apply RAG secret manifest"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - apply
+          - -f
+          - "{{ contentiq_rag_secret_manifest }}"
+      register: contentiq_step5_rag_secret_apply
+      changed_when: >-
+        'created' in contentiq_step5_rag_secret_apply.stdout
+        or 'configured' in contentiq_step5_rag_secret_apply.stdout
+      when: contentiq_apply_rag_secret | bool
+      no_log: true
+
+    - name: "Step 6: Apply ContentIQ custom resource"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - apply
+          - -f
+          - "{{ contentiq_effective_cr_manifest }}"
+      register: contentiq_step6_cr_apply
+      changed_when: >-
+        'created' in contentiq_step6_cr_apply.stdout
+        or 'configured' in contentiq_step6_cr_apply.stdout
+
+    # --- Step 6b: Align backend secret to live Routes (guide: oc patch FRONTEND_URL, CORS, cookie, OAuth + rollout restart) ---
+    - name: "Step 6b: Wait for frontend route hostname"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - route
+          - contentiq-frontend
+          - -n
+          - "{{ contentiq_namespace }}"
+          - -o
+          - jsonpath={.spec.host}
+      register: contentiq_step6b_frontend_route
+      changed_when: false
+      retries: "{{ contentiq_wait_retries }}"
+      delay: "{{ contentiq_wait_delay_seconds }}"
+      until: contentiq_step6b_frontend_route.stdout | trim | length > 0
+      when: contentiq_align_backend_secret_to_live_routes | bool
+
+    - name: "Step 6b: Wait for backend route hostname"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - route
+          - contentiq-backend
+          - -n
+          - "{{ contentiq_namespace }}"
+          - -o
+          - jsonpath={.spec.host}
+      register: contentiq_step6b_backend_route
+      changed_when: false
+      retries: "{{ contentiq_wait_retries }}"
+      delay: "{{ contentiq_wait_delay_seconds }}"
+      until: contentiq_step6b_backend_route.stdout | trim | length > 0
+      when: contentiq_align_backend_secret_to_live_routes | bool
+
+    - name: "Step 6b: Build backend secret stringData from live route hosts"
+      ansible.builtin.set_fact:
+        contentiq_step6b_live_route_secret_stringdata:
+          FRONTEND_URL: "https://{{ contentiq_step6b_fe }}"
+          CORS_ALLOWED_ORIGINS: "https://{{ contentiq_step6b_fe }}"
+          SESSION_COOKIE_DOMAIN: "{{ contentiq_step6b_fe | regex_replace('^[^.]+', '') }}"
+          MICROSOFT_REDIRECT_URI: "https://{{ contentiq_step6b_be }}/api/connections/microsoft/auth/microsoft/callback"
+      vars:
+        contentiq_step6b_fe: "{{ contentiq_step6b_frontend_route.stdout | trim }}"
+        contentiq_step6b_be: "{{ contentiq_step6b_backend_route.stdout | trim }}"
+      when: contentiq_align_backend_secret_to_live_routes | bool
+
+    - name: "Step 6b: Append Google and Box OAuth redirect URIs to route alignment"
+      ansible.builtin.set_fact:
+        contentiq_step6b_live_route_secret_stringdata: "{{ contentiq_step6b_live_route_secret_stringdata | combine(contentiq_step6b_oauth_extra) }}"
+      vars:
+        contentiq_step6b_oauth_extra:
+          GOOGLE_REDIRECT_URI: "https://{{ contentiq_step6b_be }}/api/connections/googledrive/auth/google/callback"
+          BOX_REDIRECT_URI: "https://{{ contentiq_step6b_be }}/api/connections/box/auth/box/callback"
+        contentiq_step6b_be: "{{ contentiq_step6b_backend_route.stdout | trim }}"
+      when:
+        - contentiq_align_backend_secret_to_live_routes | bool
+        - contentiq_align_backend_oauth_redirects | bool
+
+    - name: "Step 6b: Merge-patch backend secret to match live Routes"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - patch
+          - secret
+          - contentiq-backend-secrets
+          - -n
+          - "{{ contentiq_namespace }}"
+          - --type=merge
+          - -p
+          - "{{ {'stringData': contentiq_step6b_live_route_secret_stringdata} | to_json }}"
+      register: contentiq_step6b_secret_align_patch
+      changed_when: true
+      when: contentiq_align_backend_secret_to_live_routes | bool
+      no_log: true
+
+    # Same as rollout-wait-one.yml: without this, the Deployment keeps the 10m default progress deadline.
+    - name: "Step 6b: Ensure backend deployment progress deadline before route-alignment restart/wait"
+      ansible.builtin.include_tasks: "{{ playbook_dir | dirname }}/roles/contentiq_install/tasks/patch_deployment_min_progress_deadline.yml"
+      vars:
+        patch_dep_name: contentiq-backend
+        patch_dep_namespace: "{{ contentiq_namespace }}"
+      when:
+        - contentiq_align_backend_secret_to_live_routes | bool
+        - contentiq_step6b_wait_backend_rollout_after_align | bool
+
+    - name: "Step 6b: Restart backend deployment to pick up aligned secret"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - rollout
+          - restart
+          - deployment/contentiq-backend
+          - -n
+          - "{{ contentiq_namespace }}"
+      register: contentiq_step6b_backend_restart
+      changed_when: "'restarted' in contentiq_step6b_backend_restart.stdout | default('')"
+      when: contentiq_align_backend_secret_to_live_routes | bool
+
+    - name: "Step 6b: Wait for backend rollout after route alignment"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - rollout
+          - status
+          - deployment/contentiq-backend
+          - -n
+          - "{{ contentiq_namespace }}"
+          - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
+      changed_when: false
+      when:
+        - contentiq_align_backend_secret_to_live_routes | bool
+        - contentiq_step6b_wait_backend_rollout_after_align | bool
+
+    - name: "Step 6: Wait for Redis rollout (Deployment or StatefulSet)"
+      when:
+        - contentiq_enable_phased_rollout | bool
+        - contentiq_rollout_wait_redis | bool
+      block:
+        # Operator creates Redis shortly after the CR reconciles; a single oc get can race and see neither.
+        - name: "Step 6: Wait until Redis Deployment or StatefulSet exists"
+          ansible.builtin.shell:
+            cmd: |
+              set -e
+              if "{{ contentiq_oc_binary }}" get deployment contentiq-redis -n "{{ contentiq_namespace }}" >/dev/null 2>&1; then
+                exit 0
+              fi
+              if "{{ contentiq_oc_binary }}" get statefulset contentiq-redis -n "{{ contentiq_namespace }}" >/dev/null 2>&1; then
+                exit 0
+              fi
+              exit 1
+            executable: /bin/bash
+          register: contentiq_step6_redis_wait_exists
+          until: contentiq_step6_redis_wait_exists.rc == 0
+          retries: "{{ contentiq_wait_retries }}"
+          delay: "{{ contentiq_wait_delay_seconds }}"
+          changed_when: false
+
+        - name: "Step 6: Detect Redis Deployment"
+          ansible.builtin.command:
+            argv:
+              - "{{ contentiq_oc_binary }}"
+              - get
+              - deployment
+              - contentiq-redis
+              - -n
+              - "{{ contentiq_namespace }}"
+          register: contentiq_step6_redis_dep_get
+          failed_when: false
+          changed_when: false
+
+        - name: "Step 6: Detect Redis StatefulSet"
+          ansible.builtin.command:
+            argv:
+              - "{{ contentiq_oc_binary }}"
+              - get
+              - statefulset
+              - contentiq-redis
+              - -n
+              - "{{ contentiq_namespace }}"
+          register: contentiq_step6_redis_sts_get
+          failed_when: false
+          changed_when: false
+
+        - name: "Step 6: Ensure Redis deployment progress deadline before rollout wait"
+          ansible.builtin.include_tasks: "{{ playbook_dir | dirname }}/roles/contentiq_install/tasks/patch_deployment_min_progress_deadline.yml"
+          vars:
+            patch_dep_name: contentiq-redis
+            patch_dep_namespace: "{{ contentiq_namespace }}"
+          when: contentiq_step6_redis_dep_get.rc == 0
+
+        - name: "Step 6: Wait for Redis Deployment rollout"
+          ansible.builtin.command:
+            argv:
+              - "{{ contentiq_oc_binary }}"
+              - rollout
+              - status
+              - deployment/contentiq-redis
+              - -n
+              - "{{ contentiq_namespace }}"
+              - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
+          when: contentiq_step6_redis_dep_get.rc == 0
+          changed_when: false
+
+        - name: "Step 6: Wait for Redis StatefulSet rollout"
+          ansible.builtin.command:
+            argv:
+              - "{{ contentiq_oc_binary }}"
+              - rollout
+              - status
+              - statefulset/contentiq-redis
+              - -n
+              - "{{ contentiq_namespace }}"
+              - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
+          when:
+            - contentiq_step6_redis_dep_get.rc != 0
+            - contentiq_step6_redis_sts_get.rc == 0
+          changed_when: false
+
+        - name: "Step 6: Pause after Redis (before core rollouts)"
+          ansible.builtin.pause:
+            seconds: "{{ contentiq_rollout_pause_after_redis_seconds | int }}"
+          when: (contentiq_rollout_pause_after_redis_seconds | int) > 0
+
+    - name: "Step 6: Wait for core deployments rollout (phased)"
+      ansible.builtin.include_tasks: "{{ playbook_dir | dirname }}/roles/contentiq_install/tasks/rollout-wait-one.yml"
+      loop: "{{ contentiq_rollout_phase1_deployments }}"
+      loop_control:
+        loop_var: rollout_dep_name
+        index_var: rollout_dep_idx
+      vars:
+        rollout_dep_list: "{{ contentiq_rollout_phase1_deployments }}"
+      when: contentiq_enable_phased_rollout | bool
+
+    - name: "Step 6: Pause before structured-data rollouts (phase 2)"
+      ansible.builtin.pause:
+        seconds: "{{ contentiq_rollout_pause_before_phase2_seconds | int }}"
+      when:
+        - contentiq_enable_phased_rollout | bool
+        - contentiq_rollout_wait_phase2 | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+        - (contentiq_rollout_pause_before_phase2_seconds | int) > 0
+
+    # --- Step 7a: SCC, webhook cert, pull secrets (must run before phase-2 oc rollout status or pods never schedule) ---
+    - name: "Step 7a: Wait for CNPG controller deployment"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - deployment
+          - cnpg-controller-manager
+          - -n
+          - cnpg-system
+      register: contentiq_step7a_cnpg_deployment_wait
+      changed_when: false
+      retries: "{{ contentiq_wait_retries }}"
+      delay: "{{ contentiq_wait_delay_seconds }}"
+      until: contentiq_step7a_cnpg_deployment_wait.rc == 0
+      when:
+        - contentiq_enable_structured_data_poststeps | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+
+    # CNPG pods cannot start under restricted-v2 until this binding exists — do this before webhook Secret wait.
+    - name: "Step 7a: Read CNPG controller service account name (from Deployment spec)"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - deployment
+          - cnpg-controller-manager
+          - -n
+          - cnpg-system
+          - -o
+          - jsonpath={.spec.template.spec.serviceAccountName}
+      register: contentiq_step7a_cnpg_sa_cmd
+      changed_when: false
+      when:
+        - contentiq_enable_structured_data_poststeps | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+
+    - name: Set effective CNPG service account name (Step 7a)
+      ansible.builtin.set_fact:
+        contentiq_step7_cnpg_sa: "{{ (contentiq_step7a_cnpg_sa_cmd.stdout | trim) or 'default' }}"
+      when:
+        - contentiq_enable_structured_data_poststeps | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+
+    - name: "Step 7a: Grant nonroot-v2 SCC to CNPG controller service account (required before CNPG pods / webhook cert)"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - adm
+          - policy
+          - add-scc-to-user
+          - nonroot-v2
+          - -n
+          - cnpg-system
+          - -z
+          - "{{ contentiq_step7_cnpg_sa }}"
+      changed_when: false
+      when:
+        - contentiq_enable_structured_data_poststeps | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+
+    - name: "Step 7a: Wait for CNPG webhook certificate secret"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - secret
+          - cnpg-webhook-cert
+          - -n
+          - cnpg-system
+      register: contentiq_step7a_cnpg_webhook_cert_wait
+      changed_when: false
+      retries: "{{ contentiq_wait_retries }}"
+      delay: "{{ contentiq_wait_delay_seconds }}"
+      until: contentiq_step7a_cnpg_webhook_cert_wait.rc == 0
+      when:
+        - contentiq_enable_structured_data_poststeps | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+        - contentiq_step7_wait_cnpg_webhook_cert | bool
+
+    - name: "Step 7a: Ensure cnpg-webhook-cert contains ca.crt (copy from cnpg-ca-secret if missing)"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        OC="{{ contentiq_oc_binary }}"
+        NS=cnpg-system
+        if "$OC" get secret cnpg-webhook-cert -n "$NS" -o jsonpath='{.data.ca\.crt}' 2>/dev/null | grep -q .; then
+          exit 0
+        fi
+        CA=$("$OC" get secret cnpg-ca-secret -n "$NS" -o jsonpath='{.data.ca\.crt}' 2>/dev/null || true)
+        if [ -z "$CA" ]; then
+          exit 1
+        fi
+        "$OC" patch secret cnpg-webhook-cert -n "$NS" --type=json \
+          -p="[{\"op\":\"add\",\"path\":\"/data/ca.crt\",\"value\":\"${CA}\"}]"
+      args:
+        executable: /bin/bash
+      register: contentiq_step7a_webhook_ca_ensure
+      retries: "{{ contentiq_wait_retries }}"
+      delay: "{{ contentiq_wait_delay_seconds }}"
+      until: contentiq_step7a_webhook_ca_ensure.rc == 0
+      changed_when: >-
+        ('patched' in (contentiq_step7a_webhook_ca_ensure.stdout | default('')))
+        or ('patched' in (contentiq_step7a_webhook_ca_ensure.stderr | default('')))
+      when:
+        - contentiq_enable_structured_data_poststeps | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+        - contentiq_step7_wait_cnpg_webhook_cert | bool
+        - contentiq_step7_ensure_cnpg_webhook_ca_from_ca_secret | default(true) | bool
+
+    - name: "Step 7a: Wait for lakekeeper service account"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - serviceaccount
+          - lakekeeper
+          - -n
+          - "{{ contentiq_namespace }}"
+      register: contentiq_step7a_sa_lakekeeper
+      changed_when: false
+      retries: "{{ contentiq_wait_retries }}"
+      delay: "{{ contentiq_wait_delay_seconds }}"
+      until: contentiq_step7a_sa_lakekeeper.rc == 0
+      when:
+        - contentiq_enable_structured_data_poststeps | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+
+    - name: "Step 7a: Wait for trino service account"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - serviceaccount
+          - trino
+          - -n
+          - "{{ contentiq_namespace }}"
+      register: contentiq_step7a_sa_trino
+      changed_when: false
+      retries: "{{ contentiq_wait_retries }}"
+      delay: "{{ contentiq_wait_delay_seconds }}"
+      until: contentiq_step7a_sa_trino.rc == 0
+      when:
+        - contentiq_enable_structured_data_poststeps | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+
+    - name: "Step 7a: Grant nonroot-v2 SCC to Lakekeeper and Trino (CNPG granted earlier before webhook wait)"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - adm
+          - policy
+          - add-scc-to-user
+          - nonroot-v2
+          - -n
+          - "{{ item.namespace }}"
+          - -z
+          - "{{ item.serviceaccount }}"
+      loop:
+        - namespace: "{{ contentiq_namespace }}"
+          serviceaccount: lakekeeper
+        - namespace: "{{ contentiq_namespace }}"
+          serviceaccount: trino
+      changed_when: false
+      when:
+        - contentiq_enable_structured_data_poststeps | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+
+    - name: "Step 7a: Optionally delete Lakekeeper DB migration job (re-run migrations)"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - delete
+          - job
+          - lakekeeper-db-migration-1
+          - -n
+          - "{{ contentiq_namespace }}"
+          - --ignore-not-found
+      register: contentiq_step7a_migration_job_delete
+      changed_when: "'deleted' in contentiq_step7a_migration_job_delete.stdout | default('')"
+      when:
+        - contentiq_enable_structured_data_poststeps | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+        - contentiq_delete_lakekeeper_migration_job | bool
+
+    - name: "Step 7a: Link pull secret to Lakekeeper/Trino service accounts"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - secrets
+          - link
+          - "{{ item }}"
+          - "{{ contentiq_pull_secret_name }}"
+          - --for=pull
+          - -n
+          - "{{ contentiq_namespace }}"
+      loop:
+        - lakekeeper
+        - trino
+      changed_when: false
+      when:
+        - contentiq_enable_structured_data_poststeps | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+        - contentiq_manage_pull_secret | bool
+
+    - name: "Step 7a: Optionally link pull secret to default service account"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - secrets
+          - link
+          - default
+          - "{{ contentiq_pull_secret_name }}"
+          - --for=pull
+          - -n
+          - "{{ contentiq_namespace }}"
+      changed_when: false
+      when:
+        - contentiq_enable_structured_data_poststeps | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+        - contentiq_manage_pull_secret | bool
+        - contentiq_link_default_pull_secret_for_structured_data | bool
+
+    # --- Step 7b: Postgres pod before phase-2 rollouts — Lakekeeper init (wait-for-db) needs metadata DB up first ---
+    # Select CNPG instance primary only (cluster=postgres alone matches initdb Job pods and breaks oc exec -c postgres).
+    - name: "Step 7b: Wait for postgres pod"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - pod
+          - -n
+          - "{{ contentiq_namespace }}"
+          - -l
+          - cnpg.io/cluster=postgres,cnpg.io/podRole=instance,cnpg.io/instanceRole=primary
+          - -o
+          - jsonpath={.items[0].metadata.name}
+      register: contentiq_step7_postgres_pod_cmd
+      changed_when: false
+      retries: "{{ contentiq_wait_retries }}"
+      delay: "{{ contentiq_wait_delay_seconds }}"
+      until: contentiq_step7_postgres_pod_cmd.stdout | trim | length > 0
+      when:
+        - contentiq_enable_structured_data_poststeps | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+
+    - name: "Step 7b: Enable pgvector in lakekeeper_metadata DB"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - exec
+          - -n
+          - "{{ contentiq_namespace }}"
+          - "{{ contentiq_step7_postgres_pod_cmd.stdout | trim }}"
+          - -c
+          - postgres
+          - --
+          - psql
+          - -U
+          - postgres
+          - -d
+          - lakekeeper_metadata
+          - -c
+          - CREATE EXTENSION IF NOT EXISTS vector;
+      changed_when: true
+      when:
+        - contentiq_enable_structured_data_poststeps | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+        - contentiq_enable_pgvector | bool
+
+    - name: "Step 6: Wait until structured-data Deployments exist (operator may create them after core)"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - deployment
+          - "{{ item }}"
+          - -n
+          - "{{ contentiq_namespace }}"
+      register: contentiq_step6_phase2_dep_present
+      changed_when: false
+      retries: "{{ contentiq_wait_retries }}"
+      delay: "{{ contentiq_wait_delay_seconds }}"
+      until: contentiq_step6_phase2_dep_present.rc == 0
+      loop: "{{ contentiq_rollout_phase2_deployments }}"
+      when:
+        - contentiq_enable_phased_rollout | bool
+        - contentiq_rollout_wait_phase2 | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+
+    - name: "Step 6: Wait for structured-data deployments rollout (after core)"
+      ansible.builtin.include_tasks: "{{ playbook_dir | dirname }}/roles/contentiq_install/tasks/rollout-wait-one.yml"
+      loop: "{{ contentiq_rollout_phase2_deployments }}"
+      loop_control:
+        loop_var: rollout_dep_name
+        index_var: rollout_dep_idx
+      vars:
+        rollout_dep_list: "{{ contentiq_rollout_phase2_deployments }}"
+      when:
+        - contentiq_enable_phased_rollout | bool
+        - contentiq_rollout_wait_phase2 | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+
+    - name: "Step 6: Wait for all app deployments rollout (single pass, legacy)"
+      ansible.builtin.include_tasks: "{{ playbook_dir | dirname }}/roles/contentiq_install/tasks/rollout-wait-one.yml"
+      loop: "{{ contentiq_rollout_legacy_deployments }}"
+      loop_control:
+        loop_var: rollout_dep_name
+        index_var: rollout_dep_idx
+      vars:
+        rollout_dep_list: "{{ contentiq_rollout_legacy_deployments }}"
+      when: not (contentiq_enable_phased_rollout | bool)
+
+    - name: "Step 8: Capture frontend route hostname"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - route
+          - contentiq-frontend
+          - -n
+          - "{{ contentiq_namespace }}"
+          - -o
+          - jsonpath={.spec.host}
+      register: contentiq_step8_frontend_route
+      changed_when: false
+
+    - name: "Step 8: Capture backend route hostname"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - route
+          - contentiq-backend
+          - -n
+          - "{{ contentiq_namespace }}"
+          - -o
+          - jsonpath={.spec.host}
+      register: contentiq_step8_backend_route
+      changed_when: false
+
+    - name: Print installation summary
+      ansible.builtin.debug:
+        msg:
+          - "Installed CSV: {{ contentiq_installed_csv | default('n/a') }}"
+          - "Frontend URL: https://{{ contentiq_step8_frontend_route.stdout | trim }}"
+          - "Backend URL: https://{{ contentiq_step8_backend_route.stdout | trim }}"
+
+    - name: Reminder when heavy workloads were deferred
+      ansible.builtin.debug:
+        msg: >-
+          Phase-2 rollouts and Step 7 were skipped (contentiq_defer_phase2_and_structured_poststeps: true).
+          Set that to false in parameters.yml or -e and re-run when the cluster has memory for lakehouse/Trino/CNPG work.
+      when: contentiq_defer_phase2_and_structured_poststeps | bool

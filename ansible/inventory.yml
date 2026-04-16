@@ -1,0 +1,14 @@
+---
+all:
+  hosts:
+    localhost:
+      ansible_connection: local
+  children:
+    # Optional: add cluster nodes here, then include roles/contentiq_install/tasks/install_crictl.yml (SSH + become). Example:
+    # openshift_nodes:
+    #   hosts:
+    #     node1:
+    #       ansible_host: 10.0.0.5
+    #       ansible_user: core
+    openshift_nodes:
+      hosts: {}
