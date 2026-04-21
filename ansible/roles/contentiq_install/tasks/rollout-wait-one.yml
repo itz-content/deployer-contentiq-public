@@ -6,7 +6,7 @@
     patch_dep_name: "{{ rollout_dep_name }}"
     patch_dep_namespace: "{{ contentiq_namespace }}"
 
-- name: "Step 6: Wait for deployment rollout"
+- name: "Step 6: Wait for deployment rollout (first attempt)"
   ansible.builtin.command:
     argv:
       - "{{ contentiq_oc_binary }}"
@@ -16,7 +16,54 @@
       - -n
       - "{{ contentiq_namespace }}"
       - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
+  register: contentiq_rollout_status_result
   changed_when: false
+  failed_when: false
+
+- name: "Step 6: Recover stuck rollout after progress deadline exceeded"
+  when:
+    - contentiq_rollout_recover_on_progress_deadline | default(true) | bool
+    - contentiq_rollout_status_result.rc != 0
+    - "'deadline' in (contentiq_rollout_status_result.stderr | default('') | lower)"
+  block:
+    - name: "Step 6: rollout restart after progress deadline"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - rollout
+          - restart
+          - "deployment/{{ rollout_dep_name }}"
+          - -n
+          - "{{ contentiq_namespace }}"
+      changed_when: true
+    - name: "Step 6: Re-apply min progress deadline after rollout restart"
+      ansible.builtin.include_tasks: patch_deployment_min_progress_deadline.yml
+      vars:
+        patch_dep_name: "{{ rollout_dep_name }}"
+        patch_dep_namespace: "{{ contentiq_namespace }}"
+    - name: "Step 6: Wait for deployment rollout (after recovery)"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - rollout
+          - status
+          - "deployment/{{ rollout_dep_name }}"
+          - -n
+          - "{{ contentiq_namespace }}"
+          - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
+      changed_when: false
+
+- name: "Step 6: Fail if deployment rollout did not succeed"
+  ansible.builtin.fail:
+    msg: >-
+      Rollout failed for deployment/{{ rollout_dep_name }} in namespace {{ contentiq_namespace }}.
+      First attempt rc={{ contentiq_rollout_status_result.rc }} stderr={{ contentiq_rollout_status_result.stderr | default('') }}
+  when:
+    - contentiq_rollout_status_result.rc != 0
+    - not (
+        (contentiq_rollout_recover_on_progress_deadline | default(true) | bool)
+        and ('deadline' in (contentiq_rollout_status_result.stderr | default('') | lower))
+      )
 
 - name: "Step 6: Pause before next deployment (memory / scheduling breathing room)"
   ansible.builtin.pause:

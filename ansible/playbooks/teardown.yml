@@ -353,7 +353,7 @@
         argv:
           - "{{ contentiq_oc_binary }}"
           - delete
-          - subscription
+          - subscriptions.operators.coreos.com
           - "{{ contentiq_subscription_name }}"
           - -n
           - "{{ contentiq_subscription_namespace }}"

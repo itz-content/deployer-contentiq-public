@@ -83,7 +83,8 @@
     argv:
       - "{{ contentiq_oc_binary }}"
       - get
-      - subscription
+      # OLM kind; bare "subscription" resolves to ACM on many clusters (endless empty jsonpath).
+      - subscriptions.operators.coreos.com
       - "{{ contentiq_subscription_name }}"
       - -n
       - "{{ contentiq_operator_namespace }}"

@@ -17,6 +17,8 @@
     # rollout wait (including Step 6b after route alignment) so the controller does not fail first.
     contentiq_min_progress_deadline_seconds: 14400
     contentiq_apply_min_progress_deadline: true
+    contentiq_rollout_recover_on_progress_deadline: true
+    contentiq_step7_wait_postgres_ready_before_phase2: true
 
     # Step 4: OLM installs the operator into openshift-operators; deleting stale pods forces a new
     # reconcile (avoids long CSV/Installing stalls). Applies even when pull-secret tasks are skipped.
@@ -400,7 +402,8 @@
         argv:
           - "{{ contentiq_oc_binary }}"
           - get
-          - subscription
+          # OLM kind; bare "subscription" resolves to ACM on many clusters (endless empty jsonpath).
+          - subscriptions.operators.coreos.com
           - contentiq
           - -n
           - openshift-operators
@@ -1113,6 +1116,23 @@
       when:
         - contentiq_enable_structured_data_poststeps | bool
         - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+
+    - name: "Step 7b: Wait for postgres primary pod Ready"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - wait
+          - pod
+          - "{{ contentiq_step7_postgres_pod_cmd.stdout | trim }}"
+          - -n
+          - "{{ contentiq_namespace }}"
+          - --for=condition=Ready
+          - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
+      changed_when: false
+      when:
+        - contentiq_enable_structured_data_poststeps | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+        - contentiq_step7_wait_postgres_ready_before_phase2 | bool
 
     - name: "Step 7b: Enable pgvector in lakekeeper_metadata DB"
       ansible.builtin.command:

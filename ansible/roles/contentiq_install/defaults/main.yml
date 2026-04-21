@@ -4,6 +4,8 @@ contentiq_wait_retries: 2147483647
 contentiq_rollout_timeout_seconds: 14400
 contentiq_min_progress_deadline_seconds: 14400
 contentiq_apply_min_progress_deadline: true
+contentiq_rollout_recover_on_progress_deadline: true
+contentiq_step7_wait_postgres_ready_before_phase2: true
 
 contentiq_install_deployment_mode: connected
 contentiq_install_manage_mirror: false
