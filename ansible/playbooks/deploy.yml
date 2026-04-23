@@ -56,6 +56,76 @@
     contentiq_registry_password: ""
     contentiq_registry_email: ""
 
+    # When true: after the namespace exists, apply backend, RAG, and registry secrets from IBM Secrets Manager
+    # (same payloads as Tekton task-contentiq-sync-secrets-from-ibm-sm). Implementation:
+    #   - ansible: playbooks/tasks/fetch-and-apply-ibm-sm-secrets.yml (contentiq_ibmsm_sync_engine: ansible)
+    #   - shell: playbooks/scripts/sync-ibm-sm-secrets-to-cluster.sh (contentiq_ibmsm_sync_engine: shell)
+    # Requires contentiq_secrets_manager_endpoint_url + three secret UUIDs. API key: IBM_CLOUD_API_KEY /
+    # IBMCLOUD_API_KEY (or contentiq_ibmsm_api_key); if unset, fetch-and-apply-ibm-sm-secrets reads
+    # kube-system/ibm-secret like Tekton (override with contentiq_ibmsm_skip_cluster_api_key).
+    # Must set contentiq_manage_pull_secret=false (registry is applied from SM; avoids conflicting Ansible Step 2).
+    # Endpoint and UUIDs default below (same as ansible/tekton/.env.sm.example); override via env CONTENTIQ_* /
+    # SECRETS_MANAGER_ENDPOINT_URL / BACKEND_SECRET_KEY_ID / …, parameters.yml, or -e. Export into the environment
+    # (use `export` in .env.sm, or `set -a; source …; set +a`) before ansible-playbook when relying on env files.
+    contentiq_fetch_secrets_from_ibm_sm: false
+    contentiq_ibmsm_sync_engine: ansible
+    contentiq_secrets_manager_endpoint_url: >-
+      {{
+        (
+          (
+            lookup('env', 'CONTENTIQ_SECRETS_MANAGER_ENDPOINT_URL', default='')
+            | default(lookup('env', 'SECRETS_MANAGER_ENDPOINT_URL', default=''), true)
+          )
+          | trim
+        )
+        | default('https://afa20521-cd75-4864-843f-e59fd0ffd49d.us-south.secrets-manager.appdomain.cloud', true)
+      }}
+    contentiq_ibmsm_backend_secret_id: >-
+      {{
+        (
+          (
+            lookup('env', 'CONTENTIQ_IBMSM_BACKEND_SECRET_ID', default='')
+            | default(lookup('env', 'BACKEND_SECRET_KEY_ID', default=''), true)
+          )
+          | trim
+        )
+        | default('83eec62f-23d7-80d3-de6c-f7aa48c3ec4e', true)
+      }}
+    contentiq_ibmsm_rag_secret_id: >-
+      {{
+        (
+          (
+            lookup('env', 'CONTENTIQ_IBMSM_RAG_SECRET_ID', default='')
+            | default(lookup('env', 'RAG_SECRET_KEY_ID', default=''), true)
+          )
+          | trim
+        )
+        | default('3520bb5f-9050-8928-e812-67ed3c959fa8', true)
+      }}
+    contentiq_ibmsm_registry_secret_id: >-
+      {{
+        (
+          (
+            lookup('env', 'CONTENTIQ_IBMSM_REGISTRY_SECRET_ID', default='')
+            | default(lookup('env', 'REGISTRY_SECRET_KEY_ID', default=''), true)
+          )
+          | trim
+        )
+        | default('3ede12f0-7c8a-fd86-d245-197d064641f9', true)
+      }}
+    contentiq_ibmsm_backend_k8s_secret_name: "contentiq-backend-secrets"
+    contentiq_ibmsm_rag_k8s_secret_name: "personalization-api-secrets"
+    # backend/RAG SM payload: json-stringdata | env-stringdata (KEY=value, # comments) | kubernetes-yaml
+    contentiq_ibmsm_backend_payload_format: "json-stringdata"
+    contentiq_ibmsm_rag_payload_format: "kubernetes-yaml"
+    contentiq_ibmsm_registry_payload_format: "json-stringdata"
+    contentiq_ibmsm_backend_payload_base64_wrapped: false
+    contentiq_ibmsm_rag_payload_base64_wrapped: true
+    contentiq_ibmsm_registry_payload_base64_wrapped: false
+    contentiq_ibmsm_rollout_restart_after_sync: false
+    # When true: IAM token exchange logs curl/Python output (may expose the API key). Default hides output (no_log).
+    contentiq_ibmsm_debug_token_exchange: false
+
     # Step 7 post-deploy (SCC, Postgres wait before Lakekeeper rollout, pgvector, pull-secret links).
     contentiq_enable_structured_data_poststeps: true
     contentiq_enable_pgvector: true
@@ -127,6 +197,32 @@
           - whoami
       changed_when: false
 
+    - name: Assert IBM Secrets Manager sync is compatible with Ansible pull-secret steps
+      ansible.builtin.assert:
+        that:
+          - not (contentiq_manage_pull_secret | bool)
+        fail_msg: >-
+          When contentiq_fetch_secrets_from_ibm_sm is true, set contentiq_manage_pull_secret=false.
+          Registry credentials are applied from Secrets Manager (Step 1b); Ansible Step 2 must stay off
+          to avoid conflicting docker-registry secrets. Use SM payloads that include openshift-marketplace /
+          openshift-operators if catalog pulls require them, or mirror catalog images.
+      when: contentiq_fetch_secrets_from_ibm_sm | bool
+
+    - name: Assert IBM Secrets Manager sync has endpoint and secret ids
+      ansible.builtin.assert:
+        that:
+          - contentiq_secrets_manager_endpoint_url | default('') | length > 0
+          - contentiq_ibmsm_backend_secret_id | default('') | length > 0
+          - contentiq_ibmsm_rag_secret_id | default('') | length > 0
+          - contentiq_ibmsm_registry_secret_id | default('') | length > 0
+        fail_msg: >-
+          contentiq_fetch_secrets_from_ibm_sm requires a non-empty contentiq_secrets_manager_endpoint_url and
+          three IBM arbitrary secret UUIDs (playbook defaults match ansible/tekton/.env.sm.example; override with -e,
+          parameters.yml, playbooks/ibm-sm-deploy.vars.local.yml, or env CONTENTIQ_SECRETS_MANAGER_ENDPOINT_URL /
+          SECRETS_MANAGER_ENDPOINT_URL and CONTENTIQ_IBMSM_*_SECRET_ID or BACKEND_SECRET_KEY_ID / RAG_SECRET_KEY_ID /
+          REGISTRY_SECRET_KEY_ID).
+      when: contentiq_fetch_secrets_from_ibm_sm | bool
+
     - name: Assert pull secret inputs are provided when enabled
       ansible.builtin.assert:
         that:
@@ -137,7 +233,9 @@
           Pull-secret management is enabled, but registry credentials are missing.
           Set contentiq_registry_username/contentiq_registry_password/contentiq_registry_email
           in parameters.yml or pass them via -e.
-      when: contentiq_manage_pull_secret | bool
+      when:
+        - contentiq_manage_pull_secret | bool
+        - not (contentiq_fetch_secrets_from_ibm_sm | default(false) | bool)
       no_log: true
 
     - name: "Step 1: Create namespace"
@@ -151,6 +249,40 @@
       changed_when: >-
         'created' in contentiq_step1_namespace_apply.stdout
         or 'configured' in contentiq_step1_namespace_apply.stdout
+
+    - name: "Step 1b: Sync backend, RAG, and registry secrets from IBM Secrets Manager (Ansible tasks)"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/fetch-and-apply-ibm-sm-secrets.yml"
+      when:
+        - contentiq_fetch_secrets_from_ibm_sm | bool
+        - (contentiq_ibmsm_sync_engine | default('ansible') | lower) == 'ansible'
+
+    - name: "Step 1b: Sync backend, RAG, and registry secrets from IBM Secrets Manager (shell script)"
+      ansible.builtin.command:
+        argv:
+          - /bin/bash
+          - "{{ playbook_dir }}/scripts/sync-ibm-sm-secrets-to-cluster.sh"
+      environment:
+        SECRETS_MANAGER_ENDPOINT_URL: "{{ contentiq_secrets_manager_endpoint_url }}"
+        BACKEND_SECRET_KEY_ID: "{{ contentiq_ibmsm_backend_secret_id }}"
+        RAG_SECRET_KEY_ID: "{{ contentiq_ibmsm_rag_secret_id }}"
+        REGISTRY_SECRET_KEY_ID: "{{ contentiq_ibmsm_registry_secret_id }}"
+        TARGET_NAMESPACE: "{{ contentiq_namespace }}"
+        CONTENTIQ_OC_BINARY: "{{ contentiq_oc_binary }}"
+        REGISTRY_K8S_SECRET_NAME: "{{ contentiq_pull_secret_name }}"
+        BACKEND_K8S_SECRET_NAME: "{{ contentiq_ibmsm_backend_k8s_secret_name }}"
+        RAG_K8S_SECRET_NAME: "{{ contentiq_ibmsm_rag_k8s_secret_name }}"
+        BACKEND_PAYLOAD_FORMAT: "{{ contentiq_ibmsm_backend_payload_format }}"
+        RAG_PAYLOAD_FORMAT: "{{ contentiq_ibmsm_rag_payload_format }}"
+        REGISTRY_PAYLOAD_FORMAT: "{{ contentiq_ibmsm_registry_payload_format }}"
+        BACKEND_PAYLOAD_BASE64: "{{ contentiq_ibmsm_backend_payload_base64_wrapped | string }}"
+        RAG_PAYLOAD_BASE64: "{{ contentiq_ibmsm_rag_payload_base64_wrapped | string }}"
+        REGISTRY_PAYLOAD_BASE64: "{{ contentiq_ibmsm_registry_payload_base64_wrapped | string }}"
+        ROLLOUT_RESTART: "{{ contentiq_ibmsm_rollout_restart_after_sync | string }}"
+      register: contentiq_step1b_ibmsm_sync
+      changed_when: false
+      when:
+        - contentiq_fetch_secrets_from_ibm_sm | bool
+        - (contentiq_ibmsm_sync_engine | default('ansible') | lower) == 'shell'
 
     - name: "Step 2: Create pull secrets in required namespaces"
       ansible.builtin.shell: >-
@@ -536,7 +668,9 @@
         src: "{{ contentiq_backend_secret_manifest }}"
         dest: "{{ contentiq_render_dir }}/backend-secrets-rendered.yaml"
         mode: "0600"
-      when: contentiq_auto_route_hostnames | bool
+      when:
+        - contentiq_auto_route_hostnames | bool
+        - not (contentiq_fetch_secrets_from_ibm_sm | default(false) | bool)
       no_log: true
 
     # Two passes: ansible.builtin.replace has no replace_all in Ansible 13+ (shared FRONTEND + CORS keys).
@@ -546,7 +680,9 @@
         regexp: '__CONTENTIQ_FRONTEND_URL__'
         replace: "{{ contentiq_derived_frontend_url }}"
       loop: [1, 2]
-      when: contentiq_auto_route_hostnames | bool
+      when:
+        - contentiq_auto_route_hostnames | bool
+        - not (contentiq_fetch_secrets_from_ibm_sm | default(false) | bool)
       no_log: true
 
     - name: Substitute remaining route-derived keys in rendered backend secret
@@ -559,7 +695,9 @@
         - { regexp: '__CONTENTIQ_MICROSOFT_REDIRECT_URI__', replace: "{{ contentiq_derived_microsoft_redirect }}" }
         - { regexp: '__CONTENTIQ_BOX_REDIRECT_URI__', replace: "{{ contentiq_derived_box_redirect }}" }
         - { regexp: '__CONTENTIQ_GOOGLE_REDIRECT_URI__', replace: "{{ contentiq_derived_google_redirect }}" }
-      when: contentiq_auto_route_hostnames | bool
+      when:
+        - contentiq_auto_route_hostnames | bool
+        - not (contentiq_fetch_secrets_from_ibm_sm | default(false) | bool)
       no_log: true
 
     - name: Copy ContentIQ CR manifest for placeholder substitution
@@ -588,7 +726,10 @@
         contentiq_effective_backend_secret_manifest: >-
           {{
             (contentiq_render_dir ~ '/backend-secrets-rendered.yaml')
-            if (contentiq_auto_route_hostnames | bool)
+            if (
+              (contentiq_auto_route_hostnames | bool)
+              and not (contentiq_fetch_secrets_from_ibm_sm | default(false) | bool)
+            )
             else contentiq_backend_secret_manifest
           }}
         contentiq_effective_cr_manifest: >-
@@ -619,6 +760,7 @@
       changed_when: >-
         'created' in contentiq_step5_backend_secret_apply.stdout
         or 'configured' in contentiq_step5_backend_secret_apply.stdout
+      when: not (contentiq_fetch_secrets_from_ibm_sm | default(false) | bool)
       no_log: true
 
     - name: "Step 5b: Apply RAG secret manifest"
@@ -632,7 +774,9 @@
       changed_when: >-
         'created' in contentiq_step5_rag_secret_apply.stdout
         or 'configured' in contentiq_step5_rag_secret_apply.stdout
-      when: contentiq_apply_rag_secret | bool
+      when:
+        - contentiq_apply_rag_secret | bool
+        - not (contentiq_fetch_secrets_from_ibm_sm | default(false) | bool)
       no_log: true
 
     - name: "Step 6: Apply ContentIQ custom resource"

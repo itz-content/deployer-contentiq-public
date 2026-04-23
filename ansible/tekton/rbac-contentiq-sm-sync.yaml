@@ -1,0 +1,39 @@
+# ServiceAccount + permissions to apply secrets (and optional rollouts) in contentiq.
+# Extend with extra RoleBindings if you apply the same registry pull secret to other namespaces.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: contentiq-sm-sync
+  namespace: contentiq
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: contentiq-sm-sync-secrets
+  namespace: contentiq
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["contentiq-backend", "personalization-rag"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: contentiq-sm-sync-secrets
+  namespace: contentiq
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: contentiq-sm-sync-secrets
+subjects:
+  - kind: ServiceAccount
+    name: contentiq-sm-sync
+    namespace: contentiq

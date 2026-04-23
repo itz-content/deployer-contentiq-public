@@ -1,1 +1,12 @@
 .rendered/
+.ansible-tmp/
+
+parameters.yml
+secrets/
+
+# IBM Secrets Manager UUIDs + instance URL for Tekton (do not commit)
+tekton/pipelinerun-contentiq-sync-secrets.local.yaml
+tekton/.env.sm
+playbooks/ibm-sm-secrets.env
+playbooks/ibm-sm-deploy.vars.local.yml
+playbooks/.env
