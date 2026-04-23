@@ -48,8 +48,8 @@
     contentiq_apply_rag_secret: true
     contentiq_rag_secret_manifest: "{{ contentiq_root_dir }}/secrets/rag-secrets-template.yaml"
 
-    # Pull secret inputs (dynamic, user supplied via -e @parameters.yml or -e vars)
-    contentiq_manage_pull_secret: true
+    # Pull secret: when false, Step 2 is skipped (use with IBM SM registry sync so Ansible does not overwrite SM secrets).
+    contentiq_manage_pull_secret: false
     contentiq_pull_secret_name: "dockerhub-pull"
     contentiq_registry_server: "https://index.docker.io/v1/"
     contentiq_registry_username: ""
@@ -63,11 +63,13 @@
     # Requires contentiq_secrets_manager_endpoint_url + three secret UUIDs. API key: IBM_CLOUD_API_KEY /
     # IBMCLOUD_API_KEY (or contentiq_ibmsm_api_key); if unset, fetch-and-apply-ibm-sm-secrets reads
     # kube-system/ibm-secret like Tekton (override with contentiq_ibmsm_skip_cluster_api_key).
-    # Must set contentiq_manage_pull_secret=false (registry is applied from SM; avoids conflicting Ansible Step 2).
+    # Registry is applied from SM; Ansible Step 2 stays off (contentiq_manage_pull_secret: false above).
     # Endpoint and UUIDs default below (same as ansible/tekton/.env.sm.example); override via env CONTENTIQ_* /
     # SECRETS_MANAGER_ENDPOINT_URL / BACKEND_SECRET_KEY_ID / …, parameters.yml, or -e. Export into the environment
     # (use `export` in .env.sm, or `set -a; source …; set +a`) before ansible-playbook when relying on env files.
-    contentiq_fetch_secrets_from_ibm_sm: false
+    # For installs without IBM SM: -e contentiq_fetch_secrets_from_ibm_sm=false -e contentiq_manage_pull_secret=true
+    # and supply contentiq_registry_* (e.g. -e @parameters.yml).
+    contentiq_fetch_secrets_from_ibm_sm: true
     contentiq_ibmsm_sync_engine: ansible
     contentiq_secrets_manager_endpoint_url: >-
       {{
@@ -116,15 +118,17 @@
     contentiq_ibmsm_backend_k8s_secret_name: "contentiq-backend-secrets"
     contentiq_ibmsm_rag_k8s_secret_name: "personalization-api-secrets"
     # backend/RAG SM payload: json-stringdata | env-stringdata (KEY=value, # comments) | kubernetes-yaml
-    contentiq_ibmsm_backend_payload_format: "json-stringdata"
+    contentiq_ibmsm_backend_payload_format: "env-stringdata"
     contentiq_ibmsm_rag_payload_format: "kubernetes-yaml"
     contentiq_ibmsm_registry_payload_format: "json-stringdata"
-    contentiq_ibmsm_backend_payload_base64_wrapped: false
+    contentiq_ibmsm_backend_payload_base64_wrapped: true
     contentiq_ibmsm_rag_payload_base64_wrapped: true
     contentiq_ibmsm_registry_payload_base64_wrapped: false
     contentiq_ibmsm_rollout_restart_after_sync: false
     # When true: IAM token exchange logs curl/Python output (may expose the API key). Default hides output (no_log).
     contentiq_ibmsm_debug_token_exchange: false
+    # TLS verify for IBM IAM + Secrets Manager curl calls. false helps corporate TLS inspection; use true in strict envs.
+    contentiq_ibmsm_tls_validate: false
 
     # Step 7 post-deploy (SCC, Postgres wait before Lakekeeper rollout, pgvector, pull-secret links).
     contentiq_enable_structured_data_poststeps: true

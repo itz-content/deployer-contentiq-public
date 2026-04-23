@@ -7,7 +7,7 @@
 # Multi-line shell: every line must end with \ (except the last). If the line with deploy.yml has no
 # trailing \, zsh runs the next line starting with -e as a command → "command not found: -e".
 # One line (no continuations):
-#   ansible-playbook -i inventory.yml playbooks/deploy.yml -e @playbooks/ibm-sm-deploy.vars.local.yml -e contentiq_ibmsm_tls_validate=false
+#   ansible-playbook -i inventory.yml playbooks/deploy.yml -e @playbooks/ibm-sm-deploy.vars.local.yml
 #
 contentiq_fetch_secrets_from_ibm_sm: true
 contentiq_manage_pull_secret: false
@@ -15,15 +15,10 @@ contentiq_secrets_manager_endpoint_url: "https://YOUR_INSTANCE_ID.us-south.secre
 contentiq_ibmsm_backend_secret_id: "00000000-0000-0000-0000-000000000000"
 contentiq_ibmsm_rag_secret_id: "00000000-0000-0000-0000-000000000000"
 contentiq_ibmsm_registry_secret_id: "00000000-0000-0000-0000-000000000000"
-# When SM stores a base64-wrapped env file (comments + KEY=value and/or YAML-style KEY: "value"), use e.g.:
-#   contentiq_ibmsm_backend_payload_base64_wrapped: true
-#   contentiq_ibmsm_backend_payload_format: "env-stringdata"
+# Backend payload shape defaults in deploy.yml (env-stringdata + base64); override here if needed.
 # Optional: require API key from kube-system/ibm-secret (fails if missing). Otherwise ibm-secret is
 # used automatically only when IBM_CLOUD_API_KEY / IBMCLOUD_API_KEY is unset (same as shell sync script).
 # contentiq_ibmsm_api_key_from_cluster: true
 # Never read kube-system/ibm-secret from Ansible (e.g. air-gapped metadata only):
 # contentiq_ibmsm_skip_cluster_api_key: true
-# contentiq_ibmsm_tls_validate: false
-# Temporary debugging: print SM fetch/payload/manifest/oc-apply task output (may expose secrets in logs).
-# contentiq_ibmsm_apply_show_logs: true
-# Legacy alias (same effect if apply_show_logs is unset): contentiq_ibmsm_registry_apply_show_logs: true
+# contentiq_ibmsm_tls_validate: true
