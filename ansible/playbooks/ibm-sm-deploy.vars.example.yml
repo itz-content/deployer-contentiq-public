@@ -15,6 +15,12 @@ contentiq_secrets_manager_endpoint_url: "https://YOUR_INSTANCE_ID.us-south.secre
 contentiq_ibmsm_backend_secret_id: "00000000-0000-0000-0000-000000000000"
 contentiq_ibmsm_rag_secret_id: "00000000-0000-0000-0000-000000000000"
 contentiq_ibmsm_registry_secret_id: "00000000-0000-0000-0000-000000000000"
+# Optional: IBM SM arbitrary secret contentiq-broker-secrets (BROKER_API_PREFIX, BROKER_API_VERSION,
+# DEFAULT_BROKER_SERVICE_ID, PRESET_PLAN_ID, PRESET_BROKER_BEARER) for Step 9 OSB provision when
+# Step 9 OSB provision always runs after the backend Route exists; broker is fetched in Step 9 when deferred, not Step 1b.
+# contentiq_ibmsm_broker_secret_id: "00000000-0000-0000-0000-000000000000"  # override deploy.yml default if needed
+# contentiq_ibmsm_broker_payload_base64_wrapped: false
+# contentiq_ibmsm_defer_broker_sm_fetch_until_osb: false   # set false to load broker during Step 1b instead
 # Backend payload shape defaults in deploy.yml (env-stringdata + base64); override here if needed.
 # Optional: require API key from kube-system/ibm-secret (fails if missing). Otherwise ibm-secret is
 # used automatically only when IBM_CLOUD_API_KEY / IBMCLOUD_API_KEY is unset (same as shell sync script).
@@ -22,3 +28,12 @@ contentiq_ibmsm_registry_secret_id: "00000000-0000-0000-0000-000000000000"
 # Never read kube-system/ibm-secret from Ansible (e.g. air-gapped metadata only):
 # contentiq_ibmsm_skip_cluster_api_key: true
 # contentiq_ibmsm_tls_validate: true
+#
+# --- Local secret files on disk (no IBM SM) — use your filled ansible/secrets/*.yaml or override paths:
+#   ansible-playbook -i inventory.yml playbooks/deploy.yml -e contentiq_use_local_secrets=true -e contentiq_manage_pull_secret=true -e @parameters.yml
+# Equivalent without the flag: contentiq_fetch_secrets_from_ibm_sm: false (same Step 5 / 5b + route placeholder flow).
+# contentiq_use_local_secrets: true
+# contentiq_manage_pull_secret: true
+# Optional custom paths (absolute or relative to your shell cwd when you run ansible-playbook):
+# contentiq_backend_secret_manifest: ./secrets/my-backend-secrets.yaml
+# contentiq_rag_secret_manifest: ./secrets/my-rag-secrets.yaml

@@ -64,11 +64,19 @@
     # IBMCLOUD_API_KEY (or contentiq_ibmsm_api_key); if unset, fetch-and-apply-ibm-sm-secrets reads
     # kube-system/ibm-secret like Tekton (override with contentiq_ibmsm_skip_cluster_api_key).
     # Registry is applied from SM; Ansible Step 2 stays off (contentiq_manage_pull_secret: false above).
+    # contentiq_registry_pull_secret_link_enabled still runs the same oc secrets link steps as the legacy path.
     # Endpoint and UUIDs default below (same as ansible/tekton/.env.sm.example); override via env CONTENTIQ_* /
     # SECRETS_MANAGER_ENDPOINT_URL / BACKEND_SECRET_KEY_ID / …, parameters.yml, or -e. Export into the environment
     # (use `export` in .env.sm, or `set -a; source …; set +a`) before ansible-playbook when relying on env files.
     # For installs without IBM SM: -e contentiq_fetch_secrets_from_ibm_sm=false -e contentiq_manage_pull_secret=true
     # and supply contentiq_registry_* (e.g. -e @parameters.yml).
+    # Ergonomic alias for local testing: -e contentiq_use_local_secrets=true (forces fetch from SM off for this run).
+    # Uses contentiq_backend_secret_manifest + contentiq_rag_secret_manifest (defaults under ansible/secrets/).
+    # Optional broker fallback for Step 9: contentiq_broker_assignments_file (e.g. ansible/broker.yml) is used only
+    # if IBM SM deferred fetch did not run or did not set contentiq_broker_osb; prefer contentiq_ibmsm_broker_secret_id.
+    # Override those paths to point at your own filled-in YAML. You still need image pulls: set
+    # contentiq_manage_pull_secret: true and contentiq_registry_* unless the cluster already has them.
+    contentiq_use_local_secrets: false
     contentiq_fetch_secrets_from_ibm_sm: true
     contentiq_ibmsm_sync_engine: ansible
     contentiq_secrets_manager_endpoint_url: >-
@@ -115,6 +123,39 @@
         )
         | default('3ede12f0-7c8a-fd86-d245-197d064641f9', true)
       }}
+    # Optional IBM SM arbitrary secret (e.g. contentiq-broker-secrets): BROKER_API_PREFIX, BROKER_API_VERSION,
+    # DEFAULT_BROKER_SERVICE_ID, PRESET_PLAN_ID, PRESET_BROKER_BEARER — used for Step 9 OSB provision/bind.
+    contentiq_ibmsm_broker_secret_id: >-
+      {{
+        (
+          (
+            lookup('env', 'CONTENTIQ_IBMSM_BROKER_SECRET_ID', default='')
+            | default(lookup('env', 'BROKER_SECRET_KEY_ID', default=''), true)
+          )
+          | trim
+        )
+        | default('f59daca0-3701-1777-9850-dbcf6a86c929', true)
+      }}
+    contentiq_ibmsm_broker_payload_base64_wrapped: false
+    # When true, the broker secret is not read during Step 1b; Step 9 loads it after the backend Route exists.
+    contentiq_ibmsm_defer_broker_sm_fetch_until_osb: true
+    # Step 9 always runs after Step 8: OSB client uses the live backend Route (same host as install summary).
+    contentiq_osb_broker_assignments_inline: ""
+    # Local IBM SM–format broker file (KEY=value lines, same as contentiq-broker-secrets in SM); fallback after SM.
+    # Example: "{{ contentiq_root_dir }}/broker.yml" — e.g. when contentiq_ibmsm_broker_secret_id is unset.
+    contentiq_broker_assignments_file: ""
+    # After OSB bind: store APPLICATION_USERNAME / APPLICATION_PASSWORD in a Secret (optional; use for local testing).
+    contentiq_osb_apply_application_credentials_secret: false
+    contentiq_osb_application_credentials_secret_name: "contentiq-osb-application-credentials"
+    # Debug: Step 1b prints IBM SM backend GET summary (redacted payload preview) — use -e ...=true once, then off.
+    contentiq_ibmsm_debug_backend_sm_response: false
+    # Debug: OSB script prints effective broker fields (bearer length only) to stderr before PUT.
+    contentiq_osb_debug_show_effective_config: true
+    # OSB urllib calls use the backend Route from the Ansible controller; false matches contentiq_ibmsm_tls_validate
+    # for lab/internal routes. Set true when the controller trusts the cluster CA, or set contentiq_osb_tls_ca_bundle.
+    contentiq_osb_tls_validate: false
+    # Optional PEM path on the controller for OSB HTTPS when contentiq_osb_tls_validate is true.
+    contentiq_osb_tls_ca_bundle: ""
     contentiq_ibmsm_backend_k8s_secret_name: "contentiq-backend-secrets"
     contentiq_ibmsm_rag_k8s_secret_name: "personalization-api-secrets"
     # backend/RAG SM payload: json-stringdata | env-stringdata (KEY=value, # comments) | kubernetes-yaml
@@ -178,6 +219,8 @@
     contentiq_auto_route_hostnames: true
     contentiq_route_frontend_label: "contentiq-symplistic-ai"
     contentiq_route_backend_label: "api-contentiq-symplistic-ai"
+    # OpenShift Route name for RAG (install summary); override if your operator uses a different name.
+    contentiq_rag_route_name: "personalization-rag"
     contentiq_render_dir: "{{ contentiq_root_dir }}/.rendered"
 
     # After Routes exist: align contentiq-backend-secrets to live Route hosts (CUSTOMER-GUIDE oc patch flow).
@@ -200,6 +243,15 @@
           - "{{ contentiq_oc_binary }}"
           - whoami
       changed_when: false
+
+    - name: Local secrets mode — skip IBM Secrets Manager; apply manifests from disk for this run
+      ansible.builtin.set_fact:
+        contentiq_fetch_secrets_from_ibm_sm: false
+      when: contentiq_use_local_secrets | default(false) | bool
+
+    - name: Resolve whether to link registry pull secret to OLM and workload service accounts
+      ansible.builtin.set_fact:
+        contentiq_registry_pull_secret_link_enabled: "{{ (contentiq_manage_pull_secret | bool) or (contentiq_fetch_secrets_from_ibm_sm | bool) }}"
 
     - name: Assert IBM Secrets Manager sync is compatible with Ansible pull-secret steps
       ansible.builtin.assert:
@@ -327,7 +379,7 @@
         - openshift-operators
         - "{{ contentiq_namespace }}"
       changed_when: false
-      when: contentiq_manage_pull_secret | bool
+      when: contentiq_registry_pull_secret_link_enabled | bool
 
     - name: "Step 3: Apply CatalogSource"
       ansible.builtin.command:
@@ -355,7 +407,7 @@
       retries: "{{ contentiq_wait_retries }}"
       delay: "{{ contentiq_wait_delay_seconds }}"
       until: contentiq_step3_catalog_sa_wait.rc == 0
-      when: contentiq_manage_pull_secret | bool
+      when: contentiq_registry_pull_secret_link_enabled | bool
 
     - name: "Step 3: Link pull secret to catalog service accounts"
       ansible.builtin.command:
@@ -372,7 +424,7 @@
         - contentiq-operators
         - default
       changed_when: false
-      when: contentiq_manage_pull_secret | bool
+      when: contentiq_registry_pull_secret_link_enabled | bool
 
     - name: "Step 3: Restart catalog pod to pick up pull secret"
       ansible.builtin.command:
@@ -502,7 +554,7 @@
       retries: "{{ contentiq_wait_retries }}"
       delay: "{{ contentiq_wait_delay_seconds }}"
       until: contentiq_step4_operator_sa_wait.rc == 0
-      when: contentiq_manage_pull_secret | bool
+      when: contentiq_registry_pull_secret_link_enabled | bool
 
     - name: "Step 4: Link pull secret to operator service account"
       ansible.builtin.command:
@@ -516,7 +568,7 @@
           - -n
           - openshift-operators
       changed_when: false
-      when: contentiq_manage_pull_secret | bool
+      when: contentiq_registry_pull_secret_link_enabled | bool
 
     - name: "Step 4: Restart operator pods after pull-secret link"
       ansible.builtin.command:
@@ -531,7 +583,7 @@
           - --ignore-not-found
       register: contentiq_step4_operator_pod_restart
       changed_when: "'deleted' in contentiq_step4_operator_pod_restart.stdout"
-      when: contentiq_manage_pull_secret | bool
+      when: contentiq_registry_pull_secret_link_enabled | bool
 
     - name: "Step 4: Wait for subscription installed CSV"
       ansible.builtin.command:
@@ -1222,7 +1274,7 @@
       when:
         - contentiq_enable_structured_data_poststeps | bool
         - not (contentiq_defer_phase2_and_structured_poststeps | bool)
-        - contentiq_manage_pull_secret | bool
+        - contentiq_registry_pull_secret_link_enabled | bool
 
     - name: "Step 7a: Optionally link pull secret to default service account"
       ansible.builtin.command:
@@ -1239,7 +1291,7 @@
       when:
         - contentiq_enable_structured_data_poststeps | bool
         - not (contentiq_defer_phase2_and_structured_poststeps | bool)
-        - contentiq_manage_pull_secret | bool
+        - contentiq_registry_pull_secret_link_enabled | bool
         - contentiq_link_default_pull_secret_for_structured_data | bool
 
     # --- Step 7b: Postgres pod before phase-2 rollouts — Lakekeeper init (wait-for-db) needs metadata DB up first ---
@@ -1377,12 +1429,91 @@
       register: contentiq_step8_backend_route
       changed_when: false
 
-    - name: Print installation summary
+    - name: "Step 8: Capture RAG route hostname (if Route exists)"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - route
+          - "{{ contentiq_rag_route_name }}"
+          - -n
+          - "{{ contentiq_namespace }}"
+          - -o
+          - jsonpath={.spec.host}
+      register: contentiq_step8_rag_route
+      changed_when: false
+      failed_when: false
+
+    # Print URLs here (before Step 9) so the console always shows them even if OSB provision/bind fails later.
+    - name: "ContentIQ route URLs (frontend, backend, RAG)"
       ansible.builtin.debug:
         msg:
-          - "Installed CSV: {{ contentiq_installed_csv | default('n/a') }}"
           - "Frontend URL: https://{{ contentiq_step8_frontend_route.stdout | trim }}"
           - "Backend URL: https://{{ contentiq_step8_backend_route.stdout | trim }}"
+          - >-
+            RAG URL: {% if (contentiq_step8_rag_route.stdout | default('') | trim | length) > 0 -%}
+            https://{{ contentiq_step8_rag_route.stdout | trim }}
+            {%- else -%}
+            n/a (no Route {{ contentiq_rag_route_name }} in {{ contentiq_namespace }})
+            {%- endif %}
+
+    - name: "Step 9: OSB provision and bind (after backend Route from Step 8; not optional)"
+      block:
+        - name: Set backend base URL for OSB client from live Route
+          ansible.builtin.set_fact:
+            contentiq_osb_backend_origin: "https://{{ contentiq_step8_backend_route.stdout | trim }}"
+
+        # IBM SM first: TechZone / reserved-instance broker payloads must win over optional ansible/broker.yml.
+        # Previously the local file ran first and set contentiq_broker_osb, which skipped the deferred SM fetch.
+        - name: "Step 9a-sm: Fetch broker OSB settings from IBM SM when deferred from Step 1b"
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/fetch-ibm-sm-broker-osb-deferred.yml"
+          when:
+            - contentiq_ibmsm_defer_broker_sm_fetch_until_osb | default(false) | bool
+            - contentiq_fetch_secrets_from_ibm_sm | bool
+            - (contentiq_ibmsm_broker_secret_id | default('') | trim | length) > 0
+            - (contentiq_ibmsm_sync_engine | default('ansible') | lower) == 'ansible'
+            - contentiq_broker_osb is not defined
+            - (contentiq_osb_broker_assignments_inline | default('') | trim | length) == 0
+
+        - name: "Step 9a-file: Load broker OSB settings from local file (IBM SM KEY=value format; fallback)"
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/load-broker-osb-from-file.yml"
+          when:
+            - (contentiq_broker_assignments_file | default('') | trim | length) > 0
+            - contentiq_broker_osb is not defined
+
+        - name: "Step 9b: OSB PUT provision and bind (prints username/password)"
+          ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/osb-provision-bind-contentiq.yml"
+
+    - name: Print installation summary
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            [
+              'Installed CSV: ' ~ (contentiq_installed_csv | default('n/a')),
+              'Frontend URL: https://' ~ (contentiq_step8_frontend_route.stdout | trim),
+              'Backend URL: https://' ~ (contentiq_step8_backend_route.stdout | trim),
+            ]
+            + (
+              [('RAG URL: https://' ~ (contentiq_step8_rag_route.stdout | trim))]
+              if (contentiq_step8_rag_route.stdout | default('') | trim | length) > 0
+              else [
+                'RAG URL: n/a (no Route ' ~ (contentiq_rag_route_name | string) ~ ' in ' ~ (contentiq_namespace | string) ~ ')',
+              ]
+            )
+            + [
+              'OSB backend origin: https://' ~ (contentiq_step8_backend_route.stdout | trim),
+            ]
+            + (
+              [
+                'OSB instance_id: ' ~ (contentiq_osb_bind_instance_id | string),
+                'OSB binding_id: ' ~ (contentiq_osb_bind_binding_id | string),
+                'OSB username: ' ~ (contentiq_osb_bind_username | string),
+                'OSB password: ' ~ (contentiq_osb_bind_password | string),
+              ]
+              if (contentiq_osb_bind_username | default('') | trim | length) > 0
+              else []
+            )
+          }}
 
     - name: Reminder when heavy workloads were deferred
       ansible.builtin.debug:

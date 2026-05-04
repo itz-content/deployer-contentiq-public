@@ -1,0 +1,433 @@
+---
+# OSB v2 provision + bind against the deployed ContentIQ backend Route URL.
+# Expects contentiq_osb_backend_origin (e.g. https://api-....apps...) and broker settings in
+# contentiq_broker_osb (from IBM SM Step 1b) or contentiq_osb_broker_assignments_inline (same KEY = value format).
+#
+# Optional: contentiq_osb_instance_id, contentiq_osb_binding_id, contentiq_osb_provision_parameters (dict),
+# contentiq_osb_key_parameters (dict), contentiq_osb_tls_validate (bool, default true if unset; deploy.yml sets false for internal routes),
+# contentiq_osb_tls_ca_bundle (controller path to PEM when tls_validate true).
+# Backend SM raw response shape: enable contentiq_ibmsm_debug_backend_sm_response in deploy (Step 1b), not here.
+
+- name: Parse broker OSB assignments from inline when IBM SM did not populate contentiq_broker_osb
+  ansible.builtin.shell: |
+    set -euo pipefail
+    python3 <<'PY'
+    import json
+    import os
+    import re
+    import sys
+
+    raw = os.environ.get("BROKER_INLINE", "").strip()
+    if not raw:
+        sys.stderr.write("BROKER_INLINE is empty\n")
+        sys.exit(1)
+    defs = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
+        if not m:
+            continue
+        k, v = m.group(1), m.group(2).strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        defs[k] = v
+    api_prefix = (defs.get("BROKER_API_PREFIX") or "/api/broker").strip()
+    api_version = (defs.get("BROKER_API_VERSION") or "2.12").strip()
+    service_id = (
+        defs.get("DEFAULT_BROKER_SERVICE_ID")
+        or defs.get("SERVICE_ID")
+        or defs.get("CONTENTIQ_BROKER_SERVICE_ID")
+        or ""
+    ).strip()
+    plan_id = (
+        defs.get("PRESET_PLAN_ID")
+        or defs.get("PLAN_ID")
+        or defs.get("CONTENTIQ_RESOURCE_PLAN_ID")
+        or ""
+    ).strip()
+    bearer = (defs.get("PRESET_BROKER_BEARER") or defs.get("BROKER_BEARER") or "").strip()
+    out = {
+        "api_prefix": api_prefix,
+        "api_version": api_version,
+        "service_id": service_id,
+        "plan_id": plan_id,
+        "bearer": bearer,
+    }
+    missing = [k for k in ("service_id", "plan_id", "bearer") if not out[k]]
+    if missing:
+        sys.stderr.write("broker inline parse: missing keys: %s\n" % (", ".join(missing),))
+        sys.exit(1)
+    print(json.dumps(out, separators=(",", ":")))
+    PY
+  environment:
+    BROKER_INLINE: "{{ contentiq_osb_broker_assignments_inline }}"
+  register: contentiq_osb_inline_parse
+  changed_when: false
+  when:
+    - contentiq_osb_broker_assignments_inline | default('') | trim | length > 0
+    - contentiq_broker_osb is not defined
+
+- name: Apply inline-parsed broker OSB settings
+  ansible.builtin.set_fact:
+    contentiq_broker_osb: "{{ contentiq_osb_inline_parse.stdout | from_json }}"
+  when:
+    - contentiq_osb_broker_assignments_inline | default('') | trim | length > 0
+    - contentiq_broker_osb is not defined
+
+- name: Assert broker OSB settings are available for provision/bind
+  ansible.builtin.assert:
+    that:
+      - contentiq_broker_osb is defined
+      - (contentiq_broker_osb.service_id | default('') | trim | length) > 0
+      - (contentiq_broker_osb.plan_id | default('') | trim | length) > 0
+      - (contentiq_broker_osb.bearer | default('') | trim | length) > 0
+    fail_msg: >-
+      OSB provision/bind needs contentiq_broker_osb (from IBM SM broker secret id) or
+      contentiq_osb_broker_assignments_inline with BROKER_API_PREFIX, BROKER_API_VERSION, DEFAULT_BROKER_SERVICE_ID,
+      PRESET_PLAN_ID, and PRESET_BROKER_BEARER (or BROKER_BEARER).
+
+- name: Assert backend origin is set
+  ansible.builtin.assert:
+    that:
+      - contentiq_osb_backend_origin | default('') | trim | length > 0
+    fail_msg: >-
+      contentiq_osb_backend_origin must be the deployed backend base URL (e.g. https://contentiq-backend-...).
+
+- name: Resolve OSB instance id from extra var when provided
+  ansible.builtin.set_fact:
+    contentiq_osb_instance_effective: "{{ contentiq_osb_instance_id | default('') | trim }}"
+    contentiq_osb_binding_effective: "{{ contentiq_osb_binding_id | default('') | trim }}"
+
+- name: Generate OSB instance id when omitted
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - import uuid; print("%s-osb-%s" % ("{{ contentiq_namespace }}", uuid.uuid4()))
+  register: contentiq_osb_instance_uuid_cmd
+  changed_when: false
+  when: contentiq_osb_instance_effective | length == 0
+
+- name: Record generated OSB instance id
+  ansible.builtin.set_fact:
+    contentiq_osb_instance_effective: "{{ contentiq_osb_instance_uuid_cmd.stdout | trim }}"
+  when:
+    - contentiq_osb_instance_uuid_cmd is defined
+    - not (contentiq_osb_instance_uuid_cmd.skipped | default(false))
+
+- name: Generate OSB binding id when omitted
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - import uuid; print(uuid.uuid4())
+  register: contentiq_osb_binding_uuid_cmd
+  changed_when: false
+  when: contentiq_osb_binding_effective | length == 0
+
+- name: Record generated OSB binding id
+  ansible.builtin.set_fact:
+    contentiq_osb_binding_effective: "{{ contentiq_osb_binding_uuid_cmd.stdout | trim }}"
+  when:
+    - contentiq_osb_binding_uuid_cmd is defined
+    - not (contentiq_osb_binding_uuid_cmd.skipped | default(false))
+
+- name: OSB provision and bind (urllib; prints username/password on success)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    python3 <<'PY'
+    import json
+    import os
+    import ssl
+    import sys
+    import urllib.error
+    import urllib.request
+    from urllib.parse import quote
+
+    def jenv(name, default=None):
+        v = os.environ.get(name, "")
+        return v if v != "" else default
+
+    origin = jenv("OSB_ORIGIN", "").rstrip("/")
+    api_prefix = jenv("OSB_API_PREFIX", "/api/broker").strip()
+    if not api_prefix.startswith("/"):
+        api_prefix = "/" + api_prefix
+    ver = jenv("OSB_API_VERSION", "2.12").strip()
+    bearer = jenv("OSB_BEARER", "")
+    sid = jenv("OSB_SERVICE_ID", "")
+    plan = jenv("OSB_PLAN_ID", "")
+    inst = jenv("OSB_INSTANCE_ID", "")
+    bind = jenv("OSB_BINDING_ID", "")
+    prov_params_s = jenv("OSB_PROVISION_PARAMETERS_JSON", "{}")
+    key_params_s = jenv("OSB_KEY_PARAMETERS_JSON", "{}")
+
+    if not all([origin, bearer, sid, plan, inst, bind]):
+        sys.exit("missing one of OSB_ORIGIN, OSB_BEARER, OSB_SERVICE_ID, OSB_PLAN_ID, OSB_INSTANCE_ID, OSB_BINDING_ID")
+
+    try:
+        prov_params = json.loads(prov_params_s) if prov_params_s.strip() else {}
+        key_params = json.loads(key_params_s) if key_params_s.strip() else {}
+    except json.JSONDecodeError as e:
+        sys.exit("invalid provision or key parameters JSON: %s" % (e,))
+
+    if not isinstance(prov_params, dict) or not isinstance(key_params, dict):
+        sys.exit("provision and key parameters must be JSON objects")
+
+    dbg = jenv("OSB_DEBUG_CFG", "0").strip().lower()
+    if dbg in ("1", "true", "yes", "on"):
+        sys.stderr.write(
+            "DEBUG OSB effective config: origin=%r api_prefix=%r ver=%r service_id=%r plan_id=%r "
+            "bearer_len=%d instance=%r binding=%r\n"
+            % (origin, api_prefix, ver, sid, plan, len(bearer or ""), inst, bind)
+        )
+
+    tls = jenv("OSB_TLS_VALIDATE", "1") not in ("0", "false", "False")
+    ca_bundle = jenv("OSB_TLS_CA_BUNDLE", "").strip()
+
+    def urlenc(seg):
+        return quote(seg, safe="")
+
+    base_v2 = origin + api_prefix + "/v2/"
+    prov_url = base_v2 + "service_instances/" + urlenc(inst)
+    bind_url = base_v2 + "service_instances/" + urlenc(inst) + "/service_bindings/" + urlenc(bind)
+
+    ssl_ctx = None
+    if not tls:
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+    elif ca_bundle:
+        if not os.path.isfile(ca_bundle):
+            sys.exit("OSB_TLS_CA_BUNDLE is not a readable file: %r" % (ca_bundle,))
+        ssl_ctx = ssl.create_default_context(cafile=ca_bundle)
+
+    def _ssl_hint_exc(exc):
+        r = getattr(exc, "reason", exc)
+        if isinstance(r, ssl.SSLCertVerificationError) or (
+            isinstance(r, str) and "CERTIFICATE_VERIFY_FAILED" in r
+        ):
+            sys.stderr.write(
+                "TLS verify failed talking to the broker Route. Options: set contentiq_osb_tls_validate "
+                "to false for lab/internal CAs, or set contentiq_osb_tls_ca_bundle to a PEM with the route "
+                "issuer chain on the Ansible controller.\n"
+            )
+
+    def put(url, body_obj):
+        data = json.dumps(body_obj).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="PUT",
+            headers={
+                "Authorization": "Bearer " + bearer,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-Broker-API-Version": ver,
+            },
+        )
+        open_kw = {"timeout": 120}
+        if ssl_ctx is not None:
+            open_kw["context"] = ssl_ctx
+        try:
+            with urllib.request.urlopen(req, **open_kw) as resp:
+                return resp.getcode(), resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", errors="replace") if e.fp else ""
+            sys.stderr.write("HTTP %s %s\n%s\n" % (e.code, url, raw[:4000]))
+            raise
+        except urllib.error.URLError as e:
+            _ssl_hint_exc(e)
+            raise
+
+    code_p, _ = put(
+        prov_url,
+        {"service_id": sid, "plan_id": plan, "parameters": prov_params},
+    )
+    if code_p not in (200, 201, 202):
+        sys.exit("unexpected provision status %s" % (code_p,))
+
+    code_b, body_b = put(
+        bind_url,
+        {
+            "service_id": sid,
+            "plan_id": plan,
+            "parameters": key_params,
+            "bind_resource": {},
+        },
+    )
+    if code_b not in (200, 201, 202):
+        sys.exit("unexpected bind status %s" % (code_b,))
+
+    try:
+        doc = json.loads(body_b) if body_b.strip() else {}
+    except json.JSONDecodeError:
+        sys.exit("bind response was not JSON: %r" % (body_b[:500],))
+
+    creds = doc.get("credentials")
+    if not isinstance(creds, dict):
+        sys.exit("bind response missing credentials object: %s" % (json.dumps(doc, indent=2)[:4000]))
+    user = creds.get("username") or creds.get("userid") or creds.get("user_id")
+    password = creds.get("password")
+    if not isinstance(user, str) or not isinstance(password, str):
+        sys.exit(
+            "credentials missing username/password; keys=%s"
+            % (", ".join(sorted(map(str, creds.keys()))),)
+        )
+
+    print("instance_id=%s" % (inst,))
+    print("binding_id=%s" % (bind,))
+    print("username=%s" % (user,))
+    print("password=%s" % (password,))
+    PY
+  environment:
+    OSB_ORIGIN: "{{ contentiq_osb_backend_origin | trim }}"
+    OSB_API_PREFIX: "{{ contentiq_broker_osb.api_prefix | default('/api/broker') }}"
+    OSB_API_VERSION: "{{ contentiq_broker_osb.api_version | default('2.12') }}"
+    OSB_BEARER: "{{ contentiq_broker_osb.bearer }}"
+    OSB_SERVICE_ID: "{{ contentiq_broker_osb.service_id }}"
+    OSB_PLAN_ID: "{{ contentiq_broker_osb.plan_id }}"
+    OSB_INSTANCE_ID: "{{ contentiq_osb_instance_effective }}"
+    OSB_BINDING_ID: "{{ contentiq_osb_binding_effective }}"
+    OSB_PROVISION_PARAMETERS_JSON: "{{ contentiq_osb_provision_parameters | default({}) | to_json }}"
+    OSB_KEY_PARAMETERS_JSON: "{{ contentiq_osb_key_parameters | default({}) | to_json }}"
+    OSB_TLS_VALIDATE: "{{ '1' if (contentiq_osb_tls_validate | default(true) | bool) else '0' }}"
+    OSB_TLS_CA_BUNDLE: "{{ contentiq_osb_tls_ca_bundle | default('') | trim }}"
+    OSB_DEBUG_CFG: "{{ '1' if (contentiq_osb_debug_show_effective_config | default(false) | bool) else '0' }}"
+  register: contentiq_osb_provision_bind_out
+  changed_when: true
+
+- name: Record OSB bind fields for end-of-play installation summary
+  ansible.builtin.set_fact:
+    contentiq_osb_bind_instance_id: >-
+      {{
+        (
+          contentiq_osb_provision_bind_out.stdout_lines
+          | select('match', '^instance_id=.*')
+          | list
+          | first
+          | default('', true)
+        ) | regex_replace('^instance_id=', '', 1)
+      }}
+    contentiq_osb_bind_binding_id: >-
+      {{
+        (
+          contentiq_osb_provision_bind_out.stdout_lines
+          | select('match', '^binding_id=.*')
+          | list
+          | first
+          | default('', true)
+        ) | regex_replace('^binding_id=', '', 1)
+      }}
+    contentiq_osb_bind_username: >-
+      {{
+        (
+          contentiq_osb_provision_bind_out.stdout_lines
+          | select('match', '^username=.*')
+          | list
+          | first
+          | default('', true)
+        ) | regex_replace('^username=', '', 1)
+      }}
+    contentiq_osb_bind_password: >-
+      {{
+        (
+          contentiq_osb_provision_bind_out.stdout_lines
+          | select('match', '^password=.*')
+          | list
+          | first
+          | default('', true)
+        ) | regex_replace('^password=', '', 1)
+      }}
+
+- name: "Optional: persist OSB bind username/password as a Secret in the app namespace"
+  when: contentiq_osb_apply_application_credentials_secret | default(false) | bool
+  block:
+    - name: Build OSB application credentials Secret manifest from provision/bind stdout
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 <<'PY'
+        import json
+        import os
+        import re
+        import sys
+
+        raw = sys.stdin.read()
+        user = None
+        pw = None
+        for line in raw.splitlines():
+            s = line.strip()
+            mu = re.match(r"^username=(.*)$", s)
+            if mu:
+                user = mu.group(1)
+            mp = re.match(r"^password=(.*)$", s)
+            if mp:
+                pw = mp.group(1)
+        if not user or not pw:
+            sys.exit("could not parse username=/password= lines from OSB output")
+        ns = os.environ["TARGET_NS"]
+        name = os.environ["SECRET_NAME"]
+        doc = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": name, "namespace": ns},
+            "type": "Opaque",
+            "stringData": {
+                "APPLICATION_USERNAME": user,
+                "APPLICATION_PASSWORD": pw,
+            },
+        }
+        print(json.dumps(doc))
+        PY
+      args:
+        executable: /bin/bash
+        stdin: "{{ contentiq_osb_provision_bind_out.stdout | default('') }}"
+      environment:
+        TARGET_NS: "{{ contentiq_namespace }}"
+        SECRET_NAME: "{{ contentiq_osb_application_credentials_secret_name | default('contentiq-osb-application-credentials') }}"
+      register: contentiq_osb_creds_manifest_json
+      changed_when: true
+      no_log: true
+
+    - name: Stage OSB credentials Secret manifest on controller
+      ansible.builtin.tempfile:
+        state: file
+        suffix: -contentiq-osb-creds.json
+      register: contentiq_osb_creds_temp
+
+    - name: Write OSB credentials Secret manifest to temp path
+      ansible.builtin.copy:
+        dest: "{{ contentiq_osb_creds_temp.path }}"
+        content: "{{ contentiq_osb_creds_manifest_json.stdout }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Apply OSB application credentials Secret
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - apply
+          - -f
+          - "{{ contentiq_osb_creds_temp.path }}"
+      register: contentiq_osb_creds_apply
+      changed_when: >-
+        'created' in contentiq_osb_creds_apply.stdout
+        or 'configured' in contentiq_osb_creds_apply.stdout
+      no_log: true
+
+    - name: Note where OSB application credentials were stored (no secret values)
+      ansible.builtin.debug:
+        msg: >-
+          OSB bind credentials applied as Secret {{ contentiq_osb_application_credentials_secret_name | default('contentiq-osb-application-credentials') }}
+          in namespace {{ contentiq_namespace }} (keys APPLICATION_USERNAME, APPLICATION_PASSWORD).
+          Example: oc get secret -n {{ contentiq_namespace }} {{ contentiq_osb_application_credentials_secret_name | default('contentiq-osb-application-credentials') }} -o jsonpath='{.data.APPLICATION_USERNAME}' | base64 -d
+
+  always:
+    - name: Remove temp OSB credentials manifest
+      ansible.builtin.file:
+        path: "{{ contentiq_osb_creds_temp.path }}"
+        state: absent
+      when:
+        - contentiq_osb_creds_temp is defined
+        - (contentiq_osb_creds_temp.path | default('')) | length > 0
