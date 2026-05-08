@@ -23,7 +23,7 @@ spec:
   #     <reg>/library/nginx:1.27-alpine
   # - If you used `oc mirror`, you can instead apply the generated CatalogSource
   #   from oc-mirror-workspace/results-*/catalogSource*.yaml.
-  image: docker.io/symplisticai/contentiq-operator-catalog:1.2.31
+  image: docker.io/symplisticai/contentiq-operator-catalog:1.3.0
   # Required for private Docker Hub (or registry) - name of pull secret in openshift-marketplace
   secrets:
     - dockerhub-pull

@@ -249,6 +249,61 @@
         contentiq_fetch_secrets_from_ibm_sm: false
       when: contentiq_use_local_secrets | default(false) | bool
 
+    - name: IBM SM mode — force pull-secret management off for this run
+      ansible.builtin.set_fact:
+        contentiq_manage_pull_secret: false
+      when: contentiq_fetch_secrets_from_ibm_sm | bool
+
+    # Local-secrets runs often pass -e contentiq_manage_pull_secret=true but rely on a non-committed
+    # parameters.yml for registry credentials. In CI, that file is usually absent, so avoid a hard fail
+    # by disabling pull-secret management when any required registry value is empty.
+    - name: Local secrets mode — disable pull-secret management when registry inputs are empty
+      ansible.builtin.set_fact:
+        contentiq_manage_pull_secret: false
+      when: >-
+        (contentiq_use_local_secrets | default(false) | bool)
+        and (contentiq_manage_pull_secret | default(false) | bool)
+        and (
+          (contentiq_registry_username | default('') | trim | length) == 0
+          or (contentiq_registry_password | default('') | trim | length) == 0
+          or (contentiq_registry_email | default('') | trim | length) == 0
+        )
+
+    - name: Local secrets mode — pull-secret task disabled because registry inputs are empty
+      ansible.builtin.debug:
+        msg: >-
+          contentiq_manage_pull_secret was set true, but one or more of
+          contentiq_registry_username/contentiq_registry_password/contentiq_registry_email is empty.
+          Continuing with contentiq_manage_pull_secret=false for this local-secrets run.
+      when: >-
+        (contentiq_use_local_secrets | default(false) | bool)
+        and not (contentiq_fetch_secrets_from_ibm_sm | default(false) | bool)
+        and not (contentiq_manage_pull_secret | default(false) | bool)
+        and (
+          (contentiq_registry_username | default('') | trim | length) == 0
+          or (contentiq_registry_password | default('') | trim | length) == 0
+          or (contentiq_registry_email | default('') | trim | length) == 0
+        )
+
+    # broker.yml is KEY=value text (IBM SM broker shape), not Ansible YAML — you cannot use -e @broker.yml.
+    # When using local secrets and no broker path was passed, default to ansible/broker.yml if it exists.
+    - name: Stat default local broker assignments file (ansible/broker.yml)
+      ansible.builtin.stat:
+        path: "{{ contentiq_root_dir }}/broker.yml"
+      register: contentiq_local_broker_yml_stat
+      when:
+        - contentiq_use_local_secrets | default(false) | bool
+        - (contentiq_broker_assignments_file | default('') | trim | length) == 0
+
+    - name: Default OSB broker file to ansible/broker.yml for local-secrets runs when unset
+      ansible.builtin.set_fact:
+        contentiq_broker_assignments_file: "{{ contentiq_root_dir }}/broker.yml"
+      when: >-
+        (contentiq_use_local_secrets | default(false) | bool)
+        and ((contentiq_broker_assignments_file | default('') | trim | length) == 0)
+        and (not (contentiq_local_broker_yml_stat.skipped | default(false) | bool))
+        and (contentiq_local_broker_yml_stat.stat.exists | default(false) | bool)
+
     - name: Resolve whether to link registry pull secret to OLM and workload service accounts
       ansible.builtin.set_fact:
         contentiq_registry_pull_secret_link_enabled: "{{ (contentiq_manage_pull_secret | bool) or (contentiq_fetch_secrets_from_ibm_sm | bool) }}"
@@ -947,6 +1002,18 @@
       register: contentiq_step6b_backend_restart
       changed_when: "'restarted' in contentiq_step6b_backend_restart.stdout | default('')"
       when: contentiq_align_backend_secret_to_live_routes | bool
+
+    # Operator reconcile after rollout restart can reset spec.progressDeadlineSeconds to the default (600s);
+    # phased rollouts already re-patch after restart in rollout-wait-one.yml — mirror that here so Step 6b
+    # does not fail at ~10m while pods are still pulling or scheduling.
+    - name: "Step 6b: Re-ensure backend progress deadline after rollout restart"
+      ansible.builtin.include_tasks: "{{ playbook_dir | dirname }}/roles/contentiq_install/tasks/patch_deployment_min_progress_deadline.yml"
+      vars:
+        patch_dep_name: contentiq-backend
+        patch_dep_namespace: "{{ contentiq_namespace }}"
+      when:
+        - contentiq_align_backend_secret_to_live_routes | bool
+        - contentiq_step6b_wait_backend_rollout_after_align | bool
 
     - name: "Step 6b: Wait for backend rollout after route alignment"
       ansible.builtin.command:

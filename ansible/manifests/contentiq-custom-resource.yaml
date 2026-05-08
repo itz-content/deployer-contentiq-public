@@ -9,9 +9,9 @@ spec:
 
   # REQUIRED: Application images (set to your registry, tags are not auto-set by the operator)
   images:
-    frontend: "docker.io/symplisticai/contentiq-frontend:1.2.31"        # REPLACE with your mirrored image
-    backend: "docker.io/symplisticai/contentiq-backend:1.2.31"         # REPLACE with your mirrored image
-    rag: "docker.io/symplisticai/personalization-rag:1.2.31"            # REPLACE with your mirrored image
+    frontend: "docker.io/symplisticai/contentiq-frontend:1.3.0"        # REPLACE with your mirrored image
+    backend: "docker.io/symplisticai/contentiq-backend:1.3.0"         # REPLACE with your mirrored image
+    rag: "docker.io/symplisticai/personalization-rag:1.3.0"            # REPLACE with your mirrored image
     redis: "docker.io/library/redis:7-alpine"                         # Optional: set for air-gap (default is operator-managed) 
 
   # Optional: image pull secrets applied to all components (frontend/backend/rag)
