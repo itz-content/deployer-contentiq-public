@@ -1,0 +1,38 @@
+---
+# OpenShift HAProxy route timeouts for long ingest, playground SSE, and RAG calls.
+# Operator 1.3.x does not expose these on the ContentIQ CR; patch Route objects after deploy.
+
+- name: "Step 6d: Annotate Route HAProxy timeout"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - annotate
+      - route
+      - "{{ item }}"
+      - -n
+      - "{{ contentiq_namespace }}"
+      - --overwrite
+      - "haproxy.router.openshift.io/timeout={{ contentiq_route_haproxy_timeout }}"
+  register: contentiq_step6d_route_annotate
+  changed_when: "'annotated' in contentiq_step6d_route_annotate.stdout | default('') or 'configured' in contentiq_step6d_route_annotate.stdout | default('')"
+  loop: "{{ contentiq_route_timeout_targets }}"
+  when: contentiq_annotate_route_timeouts | bool
+
+- name: "Step 6d: List Route timeout annotations"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - route
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.haproxy\.router\.openshift\.io/timeout}{"\n"}{end}
+  register: contentiq_step6d_route_timeouts_list
+  changed_when: false
+  when: contentiq_annotate_route_timeouts | bool
+
+- name: "Step 6d: Route timeout annotations"
+  ansible.builtin.debug:
+    msg: "{{ contentiq_step6d_route_timeouts_list.stdout_lines | default([]) }}"
+  when: contentiq_annotate_route_timeouts | bool

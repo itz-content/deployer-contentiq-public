@@ -228,6 +228,36 @@
     contentiq_align_backend_oauth_redirects: true
     contentiq_step6b_wait_backend_rollout_after_align: true
 
+    # Frontend /env.json: operator sets ONPREM_API_URL; image reads CONTENTIQ_API_BASE_URL.
+    contentiq_align_frontend_runtime_config: true
+    contentiq_frontend_playground_stream_timeout_seconds: 1800
+    contentiq_frontend_runtime_config_patch_manifest: "{{ contentiq_root_dir }}/manifests/frontend-runtime-config-patch.yaml"
+    # false = oc exec render (no rollout). true = initContainer emptyDir patch (survives restart).
+    contentiq_frontend_apply_runtime_config_patch: true
+    contentiq_step6c_wait_frontend_rollout_after_patch: true
+    # Step 6c: oc rollout status can finish before the Route serves traffic (503). Retry Route checks.
+    contentiq_step6c_frontend_ready_timeout_seconds: 600
+    contentiq_step6c_env_json_verify_retries: 36
+    contentiq_step6c_env_json_verify_delay_seconds: 10
+
+    # Step 6d: HAProxy route timeouts (ingest, playground SSE) — CUSTOMER-GUIDE § Routes timing out.
+    # RAG is in-cluster only (no Route) unless your operator exposes spec.routes.rag; add contentiq_rag_route_name to targets if needed.
+    contentiq_annotate_route_timeouts: true
+    contentiq_route_haproxy_timeout: 1800s
+    contentiq_route_timeout_targets:
+      - contentiq-frontend
+      - contentiq-backend
+
+    # Step 6e: curl /env.json, CORS, optional edge-gateway probe from backend pod.
+    contentiq_verify_deploy_connectivity: true
+    contentiq_verify_edge_gateway_from_backend: true
+    contentiq_backend_container_name: backend
+
+    # Step 6g: edge-gateway listens on 8080; backend defaults LAKEHOUSE_INGRESS_PORT to 80 without this.
+    contentiq_align_lakehouse_ingress_port: true
+    contentiq_lakehouse_ingress_port: "8080"
+    contentiq_step6g_restart_backend_after_lakehouse_port_patch: true
+
   tasks:
     - name: Verify oc client is available
       ansible.builtin.command:
@@ -1030,6 +1060,17 @@
         - contentiq_align_backend_secret_to_live_routes | bool
         - contentiq_step6b_wait_backend_rollout_after_align | bool
 
+    - name: "Step 6c: Align frontend /env.json (CONTENTIQ_API_BASE_URL)"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/align-frontend-runtime-config.yml"
+
+    - name: "Step 6d: Annotate Route HAProxy timeouts"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/annotate-route-timeouts.yml"
+
+    - name: "Step 6e: Verify /env.json and backend CORS (post frontend align)"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/verify-deployment-connectivity.yml"
+      vars:
+        contentiq_verify_edge_gateway_from_backend: false
+
     - name: "Step 6: Wait for Redis rollout (Deployment or StatefulSet)"
       when:
         - contentiq_enable_phased_rollout | bool
@@ -1454,6 +1495,24 @@
       vars:
         rollout_dep_list: "{{ contentiq_rollout_phase2_deployments }}"
       when:
+        - contentiq_enable_phased_rollout | bool
+        - contentiq_rollout_wait_phase2 | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+
+    - name: "Step 6g: Align LAKEHOUSE_INGRESS_PORT to edge-gateway Service port"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/align-lakehouse-ingress-port.yml"
+      when:
+        - contentiq_align_lakehouse_ingress_port | bool
+        - contentiq_enable_phased_rollout | bool
+        - contentiq_rollout_wait_phase2 | bool
+        - not (contentiq_defer_phase2_and_structured_poststeps | bool)
+
+    - name: "Step 6f: Verify edge-gateway from backend (after structured-data rollouts)"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/verify-deployment-connectivity.yml"
+      vars:
+        contentiq_verify_edge_gateway_from_backend: true
+      when:
+        - contentiq_verify_deploy_connectivity | bool
         - contentiq_enable_phased_rollout | bool
         - contentiq_rollout_wait_phase2 | bool
         - not (contentiq_defer_phase2_and_structured_poststeps | bool)

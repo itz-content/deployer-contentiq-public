@@ -1,0 +1,92 @@
+---
+# edge-gateway Service exposes port 8080 (not 80). Operator sets LAKEHOUSE_INGRESS_HOST=edge-gateway
+# but often omits LAKEHOUSE_INGRESS_PORT; backend defaults to 80 and times out on catalog calls.
+
+- name: "Step 6g: Detect edge-gateway Service port"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - svc
+      - edge-gateway
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.spec.ports[0].port}
+  register: contentiq_step6g_edge_gateway_port
+  changed_when: false
+  failed_when: false
+  when: contentiq_align_lakehouse_ingress_port | bool
+
+- name: "Step 6g: Use detected edge-gateway port when available"
+  ansible.builtin.set_fact:
+    contentiq_effective_lakehouse_ingress_port: "{{ contentiq_step6g_edge_gateway_port.stdout | trim }}"
+  when:
+    - contentiq_align_lakehouse_ingress_port | bool
+    - contentiq_step6g_edge_gateway_port.rc == 0
+    - contentiq_step6g_edge_gateway_port.stdout | trim | length > 0
+
+- name: "Step 6g: Fall back to configured lakehouse ingress port"
+  ansible.builtin.set_fact:
+    contentiq_effective_lakehouse_ingress_port: "{{ contentiq_lakehouse_ingress_port | string }}"
+  when:
+    - contentiq_align_lakehouse_ingress_port | bool
+    - contentiq_effective_lakehouse_ingress_port is not defined
+
+- name: "Step 6g: Merge-patch LAKEHOUSE_INGRESS_PORT on backend secret"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - patch
+      - secret
+      - contentiq-backend-secrets
+      - -n
+      - "{{ contentiq_namespace }}"
+      - --type=merge
+      - -p
+      - >-
+        {{
+          {
+            'stringData': {
+              'LAKEHOUSE_INGRESS_PORT': contentiq_effective_lakehouse_ingress_port
+            }
+          } | to_json
+        }}
+  register: contentiq_step6g_lakehouse_port_patch
+  changed_when: true
+  when: contentiq_align_lakehouse_ingress_port | bool
+
+- name: "Step 6g: Restart backend to pick up LAKEHOUSE_INGRESS_PORT"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - rollout
+      - restart
+      - deployment/contentiq-backend
+      - -n
+      - "{{ contentiq_namespace }}"
+  register: contentiq_step6g_backend_restart
+  changed_when: "'restarted' in contentiq_step6g_backend_restart.stdout | default('')"
+  when:
+    - contentiq_align_lakehouse_ingress_port | bool
+    - contentiq_step6g_restart_backend_after_lakehouse_port_patch | bool
+
+- name: "Step 6g: Wait for backend rollout after lakehouse port patch"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - rollout
+      - status
+      - deployment/contentiq-backend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
+  changed_when: false
+  when:
+    - contentiq_align_lakehouse_ingress_port | bool
+    - contentiq_step6g_restart_backend_after_lakehouse_port_patch | bool
+
+- name: "Step 6g: LAKEHOUSE ingress port aligned"
+  ansible.builtin.debug:
+    msg: "Set LAKEHOUSE_INGRESS_PORT={{ contentiq_effective_lakehouse_ingress_port }} (edge-gateway Service port)"
+  when: contentiq_align_lakehouse_ingress_port | bool

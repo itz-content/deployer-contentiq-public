@@ -1,0 +1,184 @@
+---
+# Post-alignment checks: /env.json, backend CORS, frontend-config keys, edge-gateway from backend pod.
+
+- name: "Verify: Resolve route hostnames"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - route
+      - "{{ item.route }}"
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.spec.host}
+  register: contentiq_step6e_route_hosts
+  changed_when: false
+  loop:
+    - { route: contentiq-frontend, key: frontend }
+    - { route: contentiq-backend, key: backend }
+  when: contentiq_verify_deploy_connectivity | bool
+
+- name: "Verify: Set route host facts"
+  ansible.builtin.set_fact:
+    contentiq_verify_frontend_host: "{{ contentiq_step6e_route_hosts.results[0].stdout | trim }}"
+    contentiq_verify_backend_host: "{{ contentiq_step6e_route_hosts.results[1].stdout | trim }}"
+    contentiq_verify_frontend_origin: "https://{{ contentiq_step6e_route_hosts.results[0].stdout | trim }}"
+    contentiq_verify_backend_api_url: "https://{{ contentiq_step6e_route_hosts.results[1].stdout | trim }}"
+  when: contentiq_verify_deploy_connectivity | bool
+
+- name: "Verify: Fetch frontend /env.json"
+  ansible.builtin.uri:
+    url: "{{ contentiq_verify_frontend_origin }}/env.json"
+    method: GET
+    validate_certs: false
+    return_content: true
+    status_code: 200
+  register: contentiq_step6e_env_json
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - not (contentiq_verify_edge_gateway_from_backend | bool)
+
+- name: "Verify: Assert /env.json apiBaseUrl matches backend route"
+  ansible.builtin.assert:
+    that:
+      - contentiq_step6e_env_json.json is mapping
+      - contentiq_step6e_env_json.json.apiBaseUrl is defined
+      - contentiq_step6e_env_json.json.apiBaseUrl | length > 0
+      - contentiq_step6e_env_json.json.apiBaseUrl == contentiq_verify_backend_api_url
+    fail_msg: >-
+      /env.json apiBaseUrl must be {{ contentiq_verify_backend_api_url }}.
+      Got: {{ contentiq_step6e_env_json.content | default('') }}.
+      Patch frontend-config (CONTENTIQ_API_BASE_URL) and apply frontend-runtime-config-patch.yaml.
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - not (contentiq_verify_edge_gateway_from_backend | bool)
+
+- name: "Verify: Check backend health returns CORS for frontend origin"
+  ansible.builtin.uri:
+    url: "{{ contentiq_verify_backend_api_url }}/api/support/health"
+    method: GET
+    validate_certs: false
+    return_content: true
+    status_code: 200
+    headers:
+      Origin: "{{ contentiq_verify_frontend_origin }}"
+  register: contentiq_step6e_backend_health
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - not (contentiq_verify_edge_gateway_from_backend | bool)
+
+- name: "Verify: Assert backend CORS header"
+  ansible.builtin.assert:
+    that:
+      - contentiq_step6e_backend_health.json.status == 'healthy'
+      - contentiq_step6e_backend_health.headers['access-control-allow-origin'] == contentiq_verify_frontend_origin
+    fail_msg: >-
+      Backend health must return access-control-allow-origin={{ contentiq_verify_frontend_origin }}.
+      Headers: {{ contentiq_step6e_backend_health.headers | default({}) }}.
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - not (contentiq_verify_edge_gateway_from_backend | bool)
+
+- name: "Verify: Read frontend-config keys"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - configmap
+      - frontend-config
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.data}
+  register: contentiq_step6e_frontend_cm
+  changed_when: false
+  failed_when: false
+  when: contentiq_verify_deploy_connectivity | bool
+
+- name: "Verify: Warn when CONTENTIQ_API_BASE_URL missing from frontend-config"
+  ansible.builtin.debug:
+    msg: >-
+      WARN: frontend-config should include CONTENTIQ_API_BASE_URL={{ contentiq_verify_backend_api_url }}
+      (operator may only set ONPREM_API_URL). Step 6c merge-patch should add it.
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - contentiq_step6e_frontend_cm.stdout is defined
+    - "'CONTENTIQ_API_BASE_URL' not in contentiq_step6e_frontend_cm.stdout"
+
+- name: "Verify: Resolve backend pod for in-cluster checks"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - pods
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -l
+      - app=contentiq-backend
+      - --field-selector=status.phase=Running
+      - -o
+      - jsonpath={.items[0].metadata.name}
+  register: contentiq_step6e_backend_pod
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_step6e_backend_pod.stdout | trim | length > 0
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - contentiq_verify_edge_gateway_from_backend | bool
+
+- name: "Verify: Probe edge-gateway from backend pod"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - exec
+      - -n
+      - "{{ contentiq_namespace }}"
+      - "{{ contentiq_step6e_backend_pod.stdout | trim }}"
+      - -c
+      - "{{ contentiq_backend_container_name }}"
+      - --
+      - python3
+      - -c
+      - |
+        import urllib.request
+        urllib.request.urlopen('http://edge-gateway/management/v1/warehouse', timeout=8)
+        print('ok')
+  register: contentiq_step6e_edge_gateway_probe
+  changed_when: false
+  failed_when: false
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - contentiq_verify_edge_gateway_from_backend | bool
+
+- name: "Verify: edge-gateway probe failed (structured data / playground may lack tables)"
+  ansible.builtin.debug:
+    msg: >-
+      WARN: backend cannot reach http://edge-gateway/management/v1/warehouse within 8s.
+      Check edge-gateway, edge-auth-proxy, lakekeeper pods in {{ contentiq_namespace }}.
+      Playground structured queries and ingest-to-lakehouse may fail until this is fixed.
+      stderr: {{ contentiq_step6e_edge_gateway_probe.stderr | default('') }}
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - contentiq_verify_edge_gateway_from_backend | bool
+    - contentiq_step6e_edge_gateway_probe.rc | default(0) != 0
+
+- name: "Verify: /env.json and CORS OK"
+  ansible.builtin.debug:
+    msg:
+      - "Frontend: {{ contentiq_verify_frontend_origin }}"
+      - "Backend:  {{ contentiq_verify_backend_api_url }}"
+      - "/env.json apiBaseUrl: OK"
+      - "Backend CORS on /api/support/health: OK"
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - not (contentiq_verify_edge_gateway_from_backend | bool)
+
+- name: "Verify: edge-gateway probe result"
+  ansible.builtin.debug:
+    msg: >-
+      edge-gateway from backend: {{ 'OK' if (contentiq_step6e_edge_gateway_probe.rc | default(1)) == 0 else 'FAILED — check edge-gateway / lakekeeper pods' }}
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - contentiq_verify_edge_gateway_from_backend | bool

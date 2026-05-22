@@ -153,6 +153,37 @@
     - contentiq_validation.check_health_endpoints | bool
     - contentiq_install_frontend_route_host | default('') | length > 0
 
+- name: Check frontend /env.json exposes apiBaseUrl
+  ansible.builtin.uri:
+    url: "https://{{ contentiq_install_frontend_route_host }}/env.json"
+    method: GET
+    validate_certs: false
+    status_code: 200
+  register: contentiq_install_frontend_env_json
+  when:
+    - contentiq_validation.check_health_endpoints | bool
+    - contentiq_validation.check_frontend_env_json | default(true) | bool
+    - contentiq_install_frontend_route_host | default('') | length > 0
+    - contentiq_install_backend_route_host | default('') | length > 0
+
+- name: Assert frontend /env.json apiBaseUrl matches backend route
+  ansible.builtin.assert:
+    that:
+      - contentiq_install_frontend_env_json.json is mapping
+      - contentiq_install_frontend_env_json.json.apiBaseUrl is defined
+      - contentiq_install_frontend_env_json.json.apiBaseUrl | length > 0
+      - contentiq_install_frontend_env_json.json.apiBaseUrl == ('https://' ~ contentiq_install_backend_route_host)
+    fail_msg: >-
+      Frontend /env.json is empty or apiBaseUrl does not match the backend route.
+      Expected https://{{ contentiq_install_backend_route_host }}.
+      Got: {{ contentiq_install_frontend_env_json.content | default('') }}.
+      See CUSTOMER-GUIDE (empty /env.json) and deploy.yml Step 6c.
+  when:
+    - contentiq_validation.check_health_endpoints | bool
+    - contentiq_validation.check_frontend_env_json | default(true) | bool
+    - contentiq_install_frontend_route_host | default('') | length > 0
+    - contentiq_install_backend_route_host | default('') | length > 0
+
 - name: Capture current pod summary
   ansible.builtin.command:
     argv:
