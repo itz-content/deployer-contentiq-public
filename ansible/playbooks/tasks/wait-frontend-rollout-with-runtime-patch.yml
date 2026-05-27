@@ -1,0 +1,99 @@
+---
+# Wait for contentiq-frontend rollout while re-applying the initContainer patch if the operator
+# reverts it (prevents PermissionError on /srv/app/env.json and endless CrashLoopBackOff).
+# Registers contentiq_frontend_rollout_guard_result (rc 0 on success).
+
+- name: "Frontend rollout guard: Wait for Ready rollout with initContainer stabilization"
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      OC="{{ contentiq_oc_binary }}"
+      NS="{{ contentiq_namespace }}"
+      PATCH_FILE="{{ contentiq_frontend_runtime_config_patch_manifest }}"
+      TIMEOUT="{{ contentiq_rollout_timeout_seconds }}"
+      POLL="{{ contentiq_frontend_rollout_guard_poll_seconds | default(15) }}"
+      STABLE_CHECKS="{{ contentiq_frontend_rollout_stable_checks | default(3) }}"
+      STABLE_DELAY="{{ contentiq_frontend_rollout_stable_delay_seconds | default(10) }}"
+      DEP="contentiq-frontend"
+
+      has_init() {
+        "${OC}" get deployment "${DEP}" -n "${NS}" \
+          -o jsonpath='{.spec.template.spec.initContainers[*].name}' 2>/dev/null \
+          | grep -q 'render-frontend-env-json'
+      }
+
+      frontend_crashloop() {
+        local reasons
+        reasons=$("${OC}" get pods -n "${NS}" -l "app=${DEP}" \
+          -o jsonpath='{range .items[*]}{.status.containerStatuses[?(@.name=="frontend")].state.waiting.reason}{" "}{end}' 2>/dev/null || true)
+        echo "${reasons}" | grep -q 'CrashLoopBackOff'
+      }
+
+      apply_strategic_patch() {
+        echo "Applying frontend strategic patch (initContainer + emptyDir)..."
+        "${OC}" patch deployment "${DEP}" -n "${NS}" \
+          --type=strategic --patch-file "${PATCH_FILE}"
+      }
+
+      restart_frontend() {
+        echo "Restarting ${DEP}..."
+        "${OC}" rollout restart "deployment/${DEP}" -n "${NS}"
+      }
+
+      reconcile_patch() {
+        local restarted=0
+        if ! has_init; then
+          apply_strategic_patch
+          restart_frontend
+          restarted=1
+        elif frontend_crashloop; then
+          # CrashLoop with no initContainer is common; with init present, restart once.
+          if ! has_init; then
+            apply_strategic_patch
+          fi
+          restart_frontend
+          restarted=1
+        fi
+        echo "${restarted}"
+      }
+
+      deadline=$(( $(date +%s) + TIMEOUT ))
+      while [ "$(date +%s)" -lt "${deadline}" ]; do
+        reconcile_patch >/dev/null || true
+
+        if "${OC}" rollout status "deployment/${DEP}" -n "${NS}" --timeout=30s 2>/dev/null \
+          && has_init \
+          && ! frontend_crashloop; then
+          stable=0
+          check=1
+          while [ "${check}" -le "${STABLE_CHECKS}" ]; do
+            sleep "${STABLE_DELAY}"
+            if has_init && ! frontend_crashloop; then
+              stable=$((stable + 1))
+            else
+              echo "initContainer or pod became unhealthy during stabilization (${check}/${STABLE_CHECKS})"
+              reconcile_patch >/dev/null || true
+              stable=0
+              break
+            fi
+            check=$((check + 1))
+          done
+          if [ "${stable}" -eq "${STABLE_CHECKS}" ]; then
+            echo "Frontend rollout complete: initContainer stable, no CrashLoopBackOff"
+            exit 0
+          fi
+        fi
+
+        sleep "${POLL}"
+      done
+
+      echo "FAIL: frontend rollout guard timed out after ${TIMEOUT}s" >&2
+      echo "initContainer present: $(has_init && echo yes || echo no)" >&2
+      echo "CrashLoopBackOff: $(frontend_crashloop && echo yes || echo no)" >&2
+      "${OC}" get deployment "${DEP}" -n "${NS}" \
+        -o jsonpath='initContainers={.spec.template.spec.initContainers[*].name}{"\n"}' >&2 || true
+      "${OC}" get pods -n "${NS}" -l "app=${DEP}" -o wide >&2 || true
+      exit 1
+    executable: /bin/bash
+  register: contentiq_frontend_rollout_guard_result
+  changed_when: false

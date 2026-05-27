@@ -1,0 +1,65 @@
+---
+# Lightweight guard: re-apply initContainer patch if the operator dropped it or pods are CrashLooping.
+# Included at the start of each Step 6 rollout wait (backend/RAG/frontend).
+
+- name: "Frontend watch: Re-assert runtime patch when needed"
+  when:
+    - contentiq_align_frontend_runtime_config | default(false) | bool
+    - contentiq_frontend_apply_runtime_config_patch | default(false) | bool
+    - contentiq_frontend_watch_during_rollouts | default(true) | bool
+  block:
+    - name: "Frontend watch: Check contentiq-frontend deployment exists"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - deployment
+          - contentiq-frontend
+          - -n
+          - "{{ contentiq_namespace }}"
+      register: contentiq_frontend_watch_dep
+      failed_when: false
+      changed_when: false
+
+    - name: "Frontend watch: Read initContainer names on frontend deployment"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - deployment
+          - contentiq-frontend
+          - -n
+          - "{{ contentiq_namespace }}"
+          - -o
+          - jsonpath={.spec.template.spec.initContainers[*].name}
+      register: contentiq_frontend_watch_init
+      changed_when: false
+      when: contentiq_frontend_watch_dep.rc == 0
+
+    - name: "Frontend watch: Detect CrashLoopBackOff on frontend container"
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          reasons=$("{{ contentiq_oc_binary }}" get pods -n "{{ contentiq_namespace }}" \
+            -l app=contentiq-frontend \
+            -o jsonpath='{range .items[*]}{.status.containerStatuses[?(@.name=="frontend")].state.waiting.reason}{" "}{end}' 2>/dev/null || true)
+          if echo "${reasons}" | grep -q CrashLoopBackOff; then
+            exit 0
+          fi
+          exit 1
+        executable: /bin/bash
+      register: contentiq_frontend_watch_crashloop
+      failed_when: false
+      changed_when: false
+      when: contentiq_frontend_watch_dep.rc == 0
+
+    - name: "Frontend watch: Re-apply runtime patch (missing initContainer or CrashLoopBackOff)"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/ensure-frontend-runtime-patch.yml"
+      vars:
+        contentiq_frontend_patch_restart_after_apply: true
+        contentiq_frontend_patch_wait_rollout: false
+      when:
+        - contentiq_frontend_watch_dep.rc == 0
+        - >-
+          'render-frontend-env-json' not in (contentiq_frontend_watch_init.stdout | default(''))
+          or contentiq_frontend_watch_crashloop.rc == 0
