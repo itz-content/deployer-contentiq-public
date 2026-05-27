@@ -49,10 +49,10 @@ spec:
   # Resource limits (optional overrides - defaults shown)
   backendResources:
     requests:
-      cpu: "1"
+      cpu: "8"
       memory: "4Gi"
     limits:
-      cpu: "1"
+      cpu: "8"
       memory: "40Gi"
 
   frontendResources:

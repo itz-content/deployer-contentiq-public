@@ -1,0 +1,214 @@
+---
+# Align frontend /env.json with the live backend Route and verify via Route + in-pod checks.
+# Patch application (CrashLoop fix) lives in ensure-frontend-runtime-patch.yml.
+
+- name: "Step 6c: Apply frontend runtime patch (configmap + initContainer)"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/ensure-frontend-runtime-patch.yml"
+  vars:
+    contentiq_frontend_patch_restart_after_apply: true
+    contentiq_frontend_patch_wait_rollout: "{{ contentiq_step6c_wait_frontend_rollout_after_patch | bool }}"
+  when: contentiq_align_frontend_runtime_config | bool
+
+- name: "Step 6c: Render env.json inside a Running frontend pod (no initContainer patch)"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - pods
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -l
+      - app=contentiq-frontend
+      - --field-selector=status.phase=Running
+      - -o
+      - jsonpath={.items[0].metadata.name}
+  register: contentiq_step6c_frontend_pod
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_step6c_frontend_pod.stdout | trim | length > 0
+  when:
+    - contentiq_align_frontend_runtime_config | bool
+    - not (contentiq_frontend_apply_runtime_config_patch | bool)
+
+- name: "Step 6c: Exec render_runtime_config in Running pod (legacy path)"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - exec
+      - -n
+      - "{{ contentiq_namespace }}"
+      - "{{ contentiq_step6c_frontend_pod.stdout | trim }}"
+      - -c
+      - frontend
+      - --
+      - env
+      - CONTENTIQ_API_BASE_URL={{ contentiq_frontend_patch_backend_api_url | default('') }}
+      - CONTENTIQ_PLAYGROUND_STREAM_TIMEOUT_SECONDS={{ contentiq_frontend_playground_stream_timeout_seconds | string }}
+      - python
+      - /srv/app/on_prem_packaging/render_runtime_config.py
+  register: contentiq_step6c_render_exec
+  changed_when: true
+  when:
+    - contentiq_align_frontend_runtime_config | bool
+    - not (contentiq_frontend_apply_runtime_config_patch | bool)
+
+- name: "Step 6c: Wait for frontend Deployment Available condition"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - wait
+      - deployment/contentiq-frontend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - --for=condition=Available
+      - "--timeout={{ contentiq_step6c_frontend_ready_timeout_seconds }}s"
+  changed_when: false
+  when: contentiq_align_frontend_runtime_config | bool
+
+- name: "Step 6c: Wait for frontend Service endpoints to have ready addresses"
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      ips=$("{{ contentiq_oc_binary }}" get endpoints contentiq-frontend -n "{{ contentiq_namespace }}" \
+        -o jsonpath='{.subsets[0].addresses[*].ip}' 2>/dev/null || true)
+      test -n "$ips"
+    executable: /bin/bash
+  register: contentiq_step6c_frontend_endpoints
+  changed_when: false
+  until: contentiq_step6c_frontend_endpoints.rc == 0
+  retries: "{{ contentiq_step6c_env_json_verify_retries }}"
+  delay: "{{ contentiq_step6c_env_json_verify_delay_seconds }}"
+  when: contentiq_align_frontend_runtime_config | bool
+
+- name: "Step 6c: Wait for frontend pod Ready condition"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - wait
+      - pod
+      - -l
+      - app=contentiq-frontend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - --for=condition=Ready
+      - "--timeout={{ contentiq_step6c_frontend_ready_timeout_seconds }}s"
+  changed_when: false
+  when: contentiq_align_frontend_runtime_config | bool
+
+- name: "Step 6c: Resolve frontend pod with Ready frontend container (for in-pod checks)"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - pods
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -l
+      - app=contentiq-frontend
+      - -o
+      - jsonpath={.items[?(@.status.containerStatuses[?(@.name=="frontend")].ready==true)].metadata.name}
+  register: contentiq_step6c_ready_frontend_pod
+  changed_when: false
+  until: contentiq_step6c_ready_frontend_pod.stdout | trim | length > 0
+  retries: "{{ contentiq_step6c_env_json_verify_retries }}"
+  delay: "{{ contentiq_step6c_env_json_verify_delay_seconds }}"
+  when:
+    - contentiq_align_frontend_runtime_config | bool
+    - contentiq_step6c_verify_env_json_in_pod | default(true) | bool
+
+- name: "Step 6c: Pick first Ready frontend pod name"
+  ansible.builtin.set_fact:
+    contentiq_step6c_frontend_pod_name: "{{ contentiq_step6c_ready_frontend_pod.stdout | trim | split(' ') | first }}"
+  when:
+    - contentiq_align_frontend_runtime_config | bool
+    - contentiq_step6c_verify_env_json_in_pod | default(true) | bool
+
+- name: "Step 6c: Force-render env.json in Ready frontend pod (legacy, no initContainer patch)"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - exec
+      - -n
+      - "{{ contentiq_namespace }}"
+      - "{{ contentiq_step6c_frontend_pod_name }}"
+      - -c
+      - frontend
+      - --
+      - env
+      - CONTENTIQ_API_BASE_URL={{ contentiq_frontend_patch_backend_api_url | default('') }}
+      - CONTENTIQ_PLAYGROUND_STREAM_TIMEOUT_SECONDS={{ contentiq_frontend_playground_stream_timeout_seconds | string }}
+      - CONTENTIQ_RUNTIME_CONFIG_PATH=/config/env.json
+      - python
+      - /srv/app/on_prem_packaging/render_runtime_config.py
+  register: contentiq_step6c_force_render_exec
+  changed_when: true
+  when:
+    - contentiq_align_frontend_runtime_config | bool
+    - contentiq_frontend_force_render_env_json_after_rollout | default(true) | bool
+    - not (contentiq_frontend_apply_runtime_config_patch | bool)
+
+- name: "Step 6c: Read /srv/app/env.json from Ready frontend pod"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - exec
+      - -n
+      - "{{ contentiq_namespace }}"
+      - "{{ contentiq_step6c_frontend_pod_name }}"
+      - -c
+      - frontend
+      - --
+      - cat
+      - /srv/app/env.json
+  register: contentiq_step6c_env_json_pod
+  changed_when: false
+  until: contentiq_step6c_env_json_pod.rc == 0
+  retries: "{{ contentiq_step6c_env_json_verify_retries }}"
+  delay: "{{ contentiq_step6c_env_json_verify_delay_seconds }}"
+  when:
+    - contentiq_align_frontend_runtime_config | bool
+    - contentiq_step6c_verify_env_json_in_pod | default(true) | bool
+
+- name: "Step 6c: Assert in-pod env.json contains backend apiBaseUrl"
+  ansible.builtin.assert:
+    that:
+      - (contentiq_step6c_env_json_pod.stdout | from_json) is mapping
+      - (contentiq_step6c_env_json_pod.stdout | from_json).apiBaseUrl is defined
+      - (contentiq_step6c_env_json_pod.stdout | from_json).apiBaseUrl | length > 0
+      - (contentiq_step6c_env_json_pod.stdout | from_json).apiBaseUrl == contentiq_frontend_patch_backend_api_url
+    fail_msg: >-
+      Frontend pod env.json is empty or apiBaseUrl does not match the backend route.
+      Expected {{ contentiq_frontend_patch_backend_api_url }}.
+      Got: {{ contentiq_step6c_env_json_pod.stdout | default('') }}.
+      Check frontend-config (CONTENTIQ_API_BASE_URL) and the initContainer patch.
+  when:
+    - contentiq_align_frontend_runtime_config | bool
+    - contentiq_step6c_verify_env_json_in_pod | default(true) | bool
+
+- name: "Step 6c: Verify /env.json via Route (retry while router endpoints catch up)"
+  ansible.builtin.uri:
+    url: "https://{{ contentiq_frontend_patch_fe_route.stdout | trim }}/env.json"
+    method: GET
+    validate_certs: false
+    return_content: true
+    status_code: [200, 502, 503]
+  register: contentiq_step6c_env_json
+  until: >-
+    contentiq_step6c_env_json.status == 200
+    and contentiq_step6c_env_json.json is mapping
+    and (contentiq_step6c_env_json.json.apiBaseUrl | default('') | length) > 0
+    and contentiq_step6c_env_json.json.apiBaseUrl == contentiq_frontend_patch_backend_api_url
+  retries: "{{ contentiq_step6c_env_json_verify_retries }}"
+  delay: "{{ contentiq_step6c_env_json_verify_delay_seconds }}"
+  when: contentiq_align_frontend_runtime_config | bool
+
+- name: "Step 6c: Frontend runtime config aligned"
+  ansible.builtin.debug:
+    msg:
+      - "Frontend /env.json apiBaseUrl: {{ contentiq_step6c_env_json.json.apiBaseUrl }}"
+      - "playgroundStreamTimeoutSeconds: {{ contentiq_step6c_env_json.json.playgroundStreamTimeoutSeconds | default('(default)') }}"
+      - >-
+        Verified {% if contentiq_step6c_verify_env_json_in_pod | default(true) | bool %}in-pod and {% endif %}via Route
+        (HTTP {{ contentiq_step6c_env_json.status }})
+  when: contentiq_align_frontend_runtime_config | bool

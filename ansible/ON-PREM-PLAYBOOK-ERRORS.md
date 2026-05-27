@@ -23,10 +23,11 @@ cd ansible && ./scripts/verify-contentiq-deploy.sh
 | 6 | CR apply + rollouts | Phased: Redis → core → phase-2 structured data | Rollout timeout, OOM, SCC denied |
 | 6a-pre | `ensure-frontend-runtime-patch.yml` | initContainer + emptyDir (stop CrashLoop) | Deployment / Routes / `frontend-config` not ready yet (retries) |
 | 6b-pre | `patch-backend-secret-to-live-routes.yml` | Patch `FRONTEND_URL` / CORS (no restart yet) | Routes not created yet |
-| 6d-pre | `annotate-route-timeouts.yml` | HAProxy `1800s` on frontend/backend routes | Long requests 504 without this |
-| 6f | `verify-deployment-connectivity.yml` | Edge-gateway probe only (`contentiq_verify_env_json_and_cors: false`) | WARN if backend cannot reach `edge-gateway` |
-| 6g | `align-lakehouse-ingress-port.yml` | `LAKEHOUSE_INGRESS_PORT=8080` + backend restart | Lakehouse timeouts if port stays 80 |
-| **6-post** | `finalize-deployment-connectivity.yml` | Backend CORS restart, **Step 6c** frontend `/env.json`, full verify | See sections below — run **after** rollouts |
+| 6d-pre | `annotate-route-timeouts.yml` | HAProxy `1800s` on frontend/backend routes (early pass) | Long requests 504 without this |
+| 6f | `verify-deployment-connectivity.yml` | Edge-gateway probe only (`contentiq_verify_env_json_and_cors: false`) | WARN if backend cannot reach `edge-gateway:8080` |
+| **6-post** | `finalize-deployment-connectivity.yml` | Lakehouse port, backend CORS restart, **Step 6c** `/env.json`, **re-annotate** routes + assert, full verify | See sections below — run **after** rollouts |
+| 6-post | `align-lakehouse-ingress-port.yml` | `LAKEHOUSE_INGRESS_PORT` from `edge-gateway` Service port | Playground hangs on `edge-gateway:80` if missing |
+| 6-post | `annotate-route-timeouts.yml` + `assert-route-timeouts.yml` | Second HAProxy pass + assert (operator may strip annotations) | `ERR_INCOMPLETE_CHUNKED_ENCODING` on long streams |
 | 8–9 | Routes + OSB | Capture hostname, broker provision | Broker file/SM missing |
 
 **Important ordering (1.3.x phased deploy):** Step **6-post** aligns `/env.json` and asserts CORS. Step **6f** runs **before** 6-post and must **not** assert `/env.json` (empty `{}` is expected until 6c runs). If an older playbook checks `/env.json` at 6f, upgrade to the split-verify version in this repo.
@@ -172,7 +173,7 @@ cd ansible && ./scripts/align-backend-secret-to-routes.sh
 
 **Symptom:** Ingest, export, or playground SSE closes at ~30s–5m.
 
-**Fix:** Step 6d / 6-post annotates routes with `haproxy.router.openshift.io/timeout=1800s`, or:
+**Fix:** Step 6d-pre and **6-post** (second pass + assert) annotate routes with `haproxy.router.openshift.io/timeout=1800s`, or:
 
 ```bash
 cd ansible && ./scripts/apply-streaming-and-connectivity-fixes.sh
@@ -274,6 +275,9 @@ These appear in `oc get pods` / events; the playbook may still exit 0 if verify 
 | `contentiq_finalize_connectivity_after_deploy` | `true` | Run 6-post after rollouts |
 | `contentiq_verify_env_json_and_cors` | `true` (false at 6f only) | Split verify |
 | `contentiq_align_backend_secret_to_live_routes` | `true` | CORS / `FRONTEND_URL` |
+| `contentiq_annotate_route_timeouts` | `true` | HAProxy `1800s` (6d-pre + 6-post re-annotate) |
+| `contentiq_assert_route_timeouts` | `true` | Fail deploy if route timeout missing after 6-post |
+| `contentiq_align_lakehouse_ingress_port` | `true` | `LAKEHOUSE_INGRESS_PORT` from `edge-gateway` Service |
 | `contentiq_enable_phased_rollout` | `true` | Redis → core → phase-2 |
 | `contentiq_defer_phase2_and_structured_poststeps` | `false` | `true` on tight CRC to skip lakehouse rollouts |
 | `contentiq_auto_route_hostnames` | `true` | Fill CR route hostnames from cluster ingress domain |
@@ -289,7 +293,8 @@ These appear in `oc get pods` / events; the playbook may still exit 0 if verify 
 | `playbooks/tasks/verify-deployment-connectivity.yml` | `/env.json`, CORS, edge-gateway |
 | `playbooks/tasks/finalize-deployment-connectivity.yml` | 6-post orchestration |
 | `playbooks/tasks/patch-backend-secret-to-live-routes.yml` | Backend URL alignment |
-| `playbooks/tasks/align-lakehouse-ingress-port.yml` | Port 8080 |
+| `playbooks/tasks/align-lakehouse-ingress-port.yml` | `LAKEHOUSE_INGRESS_PORT` from `edge-gateway` Service |
+| `playbooks/tasks/assert-route-timeouts.yml` | Assert HAProxy timeout after 6-post re-annotate |
 | `manifests/frontend-runtime-config-patch.yaml` | initContainer + emptyDir (CrashLoop fix) |
 | `manifests/contentiq-custom-resource.yaml` | Images, routes, replicas |
 | `secrets/backend-secrets-template.yaml` | CORS, OAuth, cloud keys — must match routes |

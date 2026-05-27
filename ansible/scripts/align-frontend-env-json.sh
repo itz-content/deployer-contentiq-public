@@ -46,8 +46,17 @@ PY
   || echo "WARN: frontend-config not found (operator may create it later)"
 
 if [[ -f "${PATCH_FILE}" ]]; then
+  FE_IMAGE="$("${OC}" get deployment contentiq-frontend -n "${NS}" \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="frontend")].image}' 2>/dev/null || true)"
+  PATCH_APPLY="${PATCH_FILE}"
+  if [[ -n "${FE_IMAGE}" ]]; then
+    PATCH_APPLY="$(mktemp)"
+    trap 'rm -f "${PATCH_APPLY}"' EXIT
+    sed "s|image: docker.io/symplisticai/contentiq-frontend:.*|image: ${FE_IMAGE}|" \
+      "${PATCH_FILE}" > "${PATCH_APPLY}"
+  fi
   echo "Applying frontend deployment patch (initContainer renders /srv/app/env.json)..."
-  "${OC}" patch deployment contentiq-frontend -n "${NS}" --type=strategic --patch-file "${PATCH_FILE}"
+  "${OC}" patch deployment contentiq-frontend -n "${NS}" --type=strategic --patch-file "${PATCH_APPLY}"
   if ! "${OC}" get deployment contentiq-frontend -n "${NS}" \
     -o jsonpath='{.spec.template.spec.initContainers[*].name}' 2>/dev/null \
     | grep -q 'render-frontend-env-json'; then

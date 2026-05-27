@@ -1,0 +1,154 @@
+---
+# Set LAKEHOUSE_INGRESS_PORT from the edge-gateway Service port (default 8080).
+# Without this, the backend may call edge-gateway:80 and structured/playground queries hang.
+# contentiq_align_lakehouse_restart_backend: restart when secret changes (false if a later task restarts backend).
+
+- name: "Lakehouse align: Detect edge-gateway Service"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - svc
+      - "{{ contentiq_lakehouse_ingress_service_name }}"
+      - -n
+      - "{{ contentiq_namespace }}"
+  register: contentiq_lakehouse_svc_get
+  changed_when: false
+  failed_when: false
+
+- name: "Lakehouse align: Read edge-gateway Service port"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - svc
+      - "{{ contentiq_lakehouse_ingress_service_name }}"
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.spec.ports[0].port}
+  register: contentiq_lakehouse_svc_port
+  changed_when: false
+  when: contentiq_lakehouse_svc_get.rc == 0
+
+- name: "Lakehouse align: Read LAKEHOUSE_INGRESS_PORT from backend secret"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - secret
+      - contentiq-backend-secrets
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.data.LAKEHOUSE_INGRESS_PORT}
+  register: contentiq_lakehouse_secret_port_b64
+  changed_when: false
+  failed_when: false
+  when: contentiq_lakehouse_svc_get.rc == 0
+
+- name: "Lakehouse align: Decode current LAKEHOUSE_INGRESS_PORT"
+  ansible.builtin.set_fact:
+    contentiq_lakehouse_secret_port_current: >-
+      {{
+        (contentiq_lakehouse_secret_port_b64.stdout | trim | b64decode)
+        if (contentiq_lakehouse_secret_port_b64.stdout | default('') | trim | length) > 0
+        else ''
+      }}
+  when: contentiq_lakehouse_svc_get.rc == 0
+
+- name: "Lakehouse align: Determine if LAKEHOUSE_INGRESS_PORT patch is needed"
+  ansible.builtin.set_fact:
+    contentiq_lakehouse_port_needs_patch: >-
+      {{
+        (contentiq_lakehouse_secret_port_current | default('') | trim)
+        != (contentiq_lakehouse_svc_port.stdout | trim)
+      }}
+  when: contentiq_lakehouse_svc_get.rc == 0
+
+- name: "Lakehouse align: Merge-patch LAKEHOUSE_INGRESS_PORT when missing or wrong"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - patch
+      - secret
+      - contentiq-backend-secrets
+      - -n
+      - "{{ contentiq_namespace }}"
+      - --type=merge
+      - -p
+      - "{{ {'stringData': {'LAKEHOUSE_INGRESS_PORT': (contentiq_lakehouse_svc_port.stdout | trim | string)}} | to_json }}"
+  register: contentiq_lakehouse_secret_patch
+  changed_when: true
+  when:
+    - contentiq_lakehouse_svc_get.rc == 0
+    - contentiq_lakehouse_port_needs_patch | bool
+
+- name: "Lakehouse align: Ensure backend deployment progress deadline before restart"
+  ansible.builtin.include_tasks: "{{ playbook_dir | dirname }}/roles/contentiq_install/tasks/patch_deployment_min_progress_deadline.yml"
+  vars:
+    patch_dep_name: contentiq-backend
+    patch_dep_namespace: "{{ contentiq_namespace }}"
+  when:
+    - contentiq_lakehouse_svc_get.rc == 0
+    - contentiq_lakehouse_port_needs_patch | bool
+    - contentiq_align_lakehouse_restart_backend | bool
+    - contentiq_align_lakehouse_wait_rollout | bool
+
+- name: "Lakehouse align: Restart backend to pick up LAKEHOUSE_INGRESS_PORT"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - rollout
+      - restart
+      - deployment/contentiq-backend
+      - -n
+      - "{{ contentiq_namespace }}"
+  register: contentiq_lakehouse_backend_restart
+  changed_when: "'restarted' in contentiq_lakehouse_backend_restart.stdout | default('')"
+  when:
+    - contentiq_lakehouse_svc_get.rc == 0
+    - contentiq_lakehouse_port_needs_patch | bool
+    - contentiq_align_lakehouse_restart_backend | bool
+
+- name: "Lakehouse align: Wait for backend rollout after LAKEHOUSE_INGRESS_PORT patch"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - rollout
+      - status
+      - deployment/contentiq-backend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
+  changed_when: false
+  when:
+    - contentiq_lakehouse_svc_get.rc == 0
+    - contentiq_lakehouse_port_needs_patch | bool
+    - contentiq_align_lakehouse_restart_backend | bool
+    - contentiq_align_lakehouse_wait_rollout | bool
+
+- name: "Lakehouse align: edge-gateway Service not present (skip)"
+  ansible.builtin.debug:
+    msg: >-
+      Skipped LAKEHOUSE_INGRESS_PORT: Service {{ contentiq_lakehouse_ingress_service_name }} not found
+      in {{ contentiq_namespace }} (structured data may be deferred or not deployed).
+  when: contentiq_lakehouse_svc_get.rc != 0
+
+- name: "Lakehouse align: LAKEHOUSE_INGRESS_PORT already correct"
+  ansible.builtin.debug:
+    msg: >-
+      LAKEHOUSE_INGRESS_PORT={{ contentiq_lakehouse_secret_port_current | trim }}
+      matches {{ contentiq_lakehouse_ingress_service_name }} Service port (no patch).
+  when:
+    - contentiq_lakehouse_svc_get.rc == 0
+    - not (contentiq_lakehouse_port_needs_patch | bool)
+
+- name: "Lakehouse align: Patched LAKEHOUSE_INGRESS_PORT"
+  ansible.builtin.debug:
+    msg: >-
+      Set LAKEHOUSE_INGRESS_PORT={{ contentiq_lakehouse_svc_port.stdout | trim }}
+      from Service {{ contentiq_lakehouse_ingress_service_name }}.
+  when:
+    - contentiq_lakehouse_svc_get.rc == 0
+    - contentiq_lakehouse_port_needs_patch | bool

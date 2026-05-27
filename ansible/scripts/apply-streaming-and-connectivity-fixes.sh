@@ -88,16 +88,31 @@ curl -sk -D - -o /dev/null -H "Origin: ${FRONTEND_ORIGIN}" \
   "${BACKEND_ORIGIN}/api/support/health" | grep -iE 'HTTP/|access-control-allow-origin' || true
 
 echo ""
-echo "=== 7) Optional: LAKEHOUSE_INGRESS_PORT=8080 (if edge-gateway uses 8080) ==="
-if "${SCRIPT_DIR}/verify-contentiq-deploy.sh" 2>&1 | grep -q 'only :8080 works'; then
-  echo "Patching LAKEHOUSE_INGRESS_PORT=8080 and restarting backend..."
-  "${OC}" patch secret contentiq-backend-secrets -n "${NS}" --type=merge \
-    -p '{"stringData":{"LAKEHOUSE_INGRESS_PORT":"8080"}}'
-  "${OC}" rollout restart deployment/contentiq-backend -n "${NS}"
-  "${OC}" rollout status deployment/contentiq-backend -n "${NS}" --timeout=600s
+echo "=== 7) LAKEHOUSE_INGRESS_PORT from edge-gateway Service (when present) ==="
+if "${OC}" get svc edge-gateway -n "${NS}" >/dev/null 2>&1; then
+  EG_PORT="$("${OC}" get svc edge-gateway -n "${NS}" -o jsonpath='{.spec.ports[0].port}')"
+  CUR_PORT="$("${OC}" get secret contentiq-backend-secrets -n "${NS}" \
+    -o jsonpath='{.data.LAKEHOUSE_INGRESS_PORT}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+  if [[ "${CUR_PORT}" != "${EG_PORT}" ]]; then
+    echo "Patching LAKEHOUSE_INGRESS_PORT=${EG_PORT} and restarting backend..."
+    "${OC}" patch secret contentiq-backend-secrets -n "${NS}" --type=merge \
+      -p "{\"stringData\":{\"LAKEHOUSE_INGRESS_PORT\":\"${EG_PORT}\"}}"
+    "${OC}" rollout restart deployment/contentiq-backend -n "${NS}"
+    "${OC}" rollout status deployment/contentiq-backend -n "${NS}" --timeout=600s
+  else
+    echo "OK: LAKEHOUSE_INGRESS_PORT=${CUR_PORT}"
+  fi
 else
-  echo "Skipping lakehouse port patch (verify script did not suggest :8080)."
+  echo "Skipping lakehouse port patch (edge-gateway Service not found)."
 fi
+
+echo ""
+echo "=== 8) Re-annotate route timeouts (after backend/frontend rollouts) ==="
+for R in contentiq-frontend contentiq-backend; do
+  "${OC}" annotate route "${R}" -n "${NS}" --overwrite "haproxy.router.openshift.io/timeout=${ROUTE_TIMEOUT}"
+done
+"${OC}" get route -n "${NS}" contentiq-frontend contentiq-backend \
+  -o custom-columns=NAME:.metadata.name,TIMEOUT:.metadata.annotations.'haproxy\.router\.openshift\.io/timeout'
 
 echo ""
 echo "=== Done — when you should see changes ==="

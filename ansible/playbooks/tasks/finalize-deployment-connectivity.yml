@@ -2,9 +2,16 @@
 # One-shot post-rollout connectivity: HAProxy timeouts, backend CORS/URLs, frontend /env.json, verification.
 # Run after core (and ideally structured-data) operands are Ready so operator reconcile does not undo alignment.
 
-- name: "Finalize: Annotate Route HAProxy timeouts (ingest, playground SSE)"
+- name: "Finalize: Annotate Route HAProxy timeouts (first pass)"
   ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/annotate-route-timeouts.yml"
   when: contentiq_annotate_route_timeouts | bool
+
+- name: "Finalize: Align LAKEHOUSE_INGRESS_PORT from edge-gateway Service (patch only; backend restarts below)"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/align-lakehouse-ingress-port.yml"
+  vars:
+    contentiq_align_lakehouse_restart_backend: false
+    contentiq_align_lakehouse_wait_rollout: false
+  when: contentiq_align_lakehouse_ingress_port | bool
 
 - name: "Finalize: Align backend secret to live Routes (restart + wait)"
   ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/patch-backend-secret-to-live-routes.yml"
@@ -16,6 +23,16 @@
 - name: "Finalize: Align frontend /env.json and playground stream timeout"
   ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/align-frontend-runtime-config.yml"
   when: contentiq_align_frontend_runtime_config | bool
+
+- name: "Finalize: Re-annotate Route HAProxy timeouts (after rollouts; operator may reset Routes)"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/annotate-route-timeouts.yml"
+  when: contentiq_annotate_route_timeouts | bool
+
+- name: "Finalize: Assert app Route HAProxy timeouts"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/assert-route-timeouts.yml"
+  when:
+    - contentiq_annotate_route_timeouts | bool
+    - contentiq_assert_route_timeouts | bool
 
 - name: "Finalize: Verify /env.json, CORS, and optional edge-gateway"
   ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/verify-deployment-connectivity.yml"
