@@ -297,36 +297,39 @@
         contentiq_manage_pull_secret: false
       when: contentiq_fetch_secrets_from_ibm_sm | bool
 
-    # Local-secrets runs often pass -e contentiq_manage_pull_secret=true but rely on a non-committed
-    # parameters.yml for registry credentials. In CI, that file is usually absent, so avoid a hard fail
-    # by disabling pull-secret management when any required registry value is empty.
-    - name: Local secrets mode — disable pull-secret management when registry inputs are empty
+    # TechZone / CI often pass contentiq_manage_pull_secret=true with -e @parameters.yml but no
+    # registry credentials (parameters.yml is gitignored and not in the release). Avoid a hard fail
+    # when any required registry value is empty and IBM SM fetch is off.
+    - name: Disable pull-secret management when registry inputs are empty (non-IBM-SM path)
       ansible.builtin.set_fact:
         contentiq_manage_pull_secret: false
-      when: >-
-        (contentiq_use_local_secrets | default(false) | bool)
-        and (contentiq_manage_pull_secret | default(false) | bool)
-        and (
+      when:
+        - not (contentiq_fetch_secrets_from_ibm_sm | default(false) | bool)
+        - contentiq_manage_pull_secret | default(false) | bool
+        - >-
           (contentiq_registry_username | default('') | trim | length) == 0
           or (contentiq_registry_password | default('') | trim | length) == 0
           or (contentiq_registry_email | default('') | trim | length) == 0
-        )
 
-    - name: Local secrets mode — pull-secret task disabled because registry inputs are empty
+    - name: Pull-secret task disabled because registry inputs are empty
       ansible.builtin.debug:
         msg: >-
-          contentiq_manage_pull_secret was set true, but one or more of
-          contentiq_registry_username/contentiq_registry_password/contentiq_registry_email is empty.
-          Continuing with contentiq_manage_pull_secret=false for this local-secrets run.
-      when: >-
-        (contentiq_use_local_secrets | default(false) | bool)
-        and not (contentiq_fetch_secrets_from_ibm_sm | default(false) | bool)
-        and not (contentiq_manage_pull_secret | default(false) | bool)
-        and (
-          (contentiq_registry_username | default('') | trim | length) == 0
-          or (contentiq_registry_password | default('') | trim | length) == 0
-          or (contentiq_registry_email | default('') | trim | length) == 0
-        )
+          contentiq_manage_pull_secret was true but registry credentials are incomplete
+          (missing: {{ contentiq_registry_missing_keys | join(', ') }}).
+          Continuing with contentiq_manage_pull_secret=false. For TechZone, prefer IBM SM
+          (contentiq_fetch_secrets_from_ibm_sm: true) or pass registry creds via
+          post_deploy_override_variables / playbooks/techzone-deploy.vars.example.yml.
+      vars:
+        contentiq_registry_missing_keys: >-
+          {{
+            ([] if (contentiq_registry_username | default('') | trim | length) > 0 else ['contentiq_registry_username'])
+            + ([] if (contentiq_registry_password | default('') | trim | length) > 0 else ['contentiq_registry_password'])
+            + ([] if (contentiq_registry_email | default('') | trim | length) > 0 else ['contentiq_registry_email'])
+          }}
+      when:
+        - not (contentiq_fetch_secrets_from_ibm_sm | default(false) | bool)
+        - not (contentiq_manage_pull_secret | default(false) | bool)
+        - contentiq_registry_missing_keys | length > 0
 
     # broker.yml is KEY=value text (IBM SM broker shape), not Ansible YAML — you cannot use -e @broker.yml.
     # When using local secrets and no broker path was passed, default to ansible/broker.yml if it exists.
@@ -380,17 +383,26 @@
     - name: Assert pull secret inputs are provided when enabled
       ansible.builtin.assert:
         that:
-          - contentiq_registry_username | length > 0
-          - contentiq_registry_password | length > 0
-          - contentiq_registry_email | length > 0
+          - (contentiq_registry_username | default('') | trim | length) > 0
+          - (contentiq_registry_password | default('') | trim | length) > 0
+          - (contentiq_registry_email | default('') | trim | length) > 0
         fail_msg: >-
-          Pull-secret management is enabled, but registry credentials are missing.
-          Set contentiq_registry_username/contentiq_registry_password/contentiq_registry_email
-          in parameters.yml or pass them via -e.
+          Pull-secret management is enabled (contentiq_manage_pull_secret=true,
+          contentiq_fetch_secrets_from_ibm_sm=false) but registry credentials are incomplete.
+          Missing: {{ contentiq_registry_missing_keys | join(', ') }}.
+          Fix: pass contentiq_registry_username/password/email via -e, parameters.yml, or
+          post_deploy_override_variables; or use IBM SM (contentiq_fetch_secrets_from_ibm_sm: true,
+          contentiq_manage_pull_secret: false) — see playbooks/techzone-deploy.vars.example.yml.
+      vars:
+        contentiq_registry_missing_keys: >-
+          {{
+            ([] if (contentiq_registry_username | default('') | trim | length) > 0 else ['contentiq_registry_username'])
+            + ([] if (contentiq_registry_password | default('') | trim | length) > 0 else ['contentiq_registry_password'])
+            + ([] if (contentiq_registry_email | default('') | trim | length) > 0 else ['contentiq_registry_email'])
+          }}
       when:
         - contentiq_manage_pull_secret | bool
         - not (contentiq_fetch_secrets_from_ibm_sm | default(false) | bool)
-      no_log: true
 
     - name: "Step 1: Create namespace"
       ansible.builtin.command:

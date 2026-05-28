@@ -1,0 +1,33 @@
+---
+# TechZone / deployer custom_values — Ansible parameters file (no secrets).
+#
+# In TechZone Terraform overrides → custom_values, reference this file from the release tag:
+#
+#   {
+#     "deployer": {
+#       "public": true,
+#       "repoName": "deployer-contentiq-public",
+#       "release": "contentiq-1.0.0-ansible",
+#       "parameters": "ansible/playbooks/techzone-deploy.vars.example.yml",
+#       "ansible": {
+#         "ansiblePlaybook": "ansible/playbooks/deploy.yml"
+#       }
+#     }
+#   }
+#
+# Or pass the same keys via Terraform override post_deploy_override_variables (JSON string).
+#
+# IBM Secrets Manager path (default for TechZone OCP on IBM Cloud): uses kube-system/ibm-secret
+# for IAM when IBM_CLOUD_API_KEY is unset. Override SM endpoint/UUIDs if not using playbook defaults.
+
+contentiq_fetch_secrets_from_ibm_sm: true
+contentiq_manage_pull_secret: false
+
+# Optional: skip OSB Step 9 in lab when broker secret is not configured
+# contentiq_skip_osb_provision: true
+
+# --- Local disk secrets (no IBM SM) — only if you pre-fill ansible/secrets/*.yaml in the release:
+# contentiq_use_local_secrets: true
+# contentiq_fetch_secrets_from_ibm_sm: false
+# contentiq_manage_pull_secret: false
+# (If you need Ansible to create docker pull secrets, set manage true AND pass registry creds.)

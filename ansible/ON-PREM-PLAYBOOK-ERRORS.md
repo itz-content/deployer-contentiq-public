@@ -190,7 +190,7 @@ cd ansible && ./scripts/apply-streaming-and-connectivity-fixes.sh
 | `oc` client not available | Ansible host missing `oc` or wrong `PATH` | Install CLI, `oc login` |
 | IBM SM: `contentiq_manage_pull_secret` must be false | Both SM and Step 2 pull secret enabled | `-e contentiq_manage_pull_secret=false` for SM runs |
 | IBM SM: missing endpoint or secret UUIDs | Incomplete `ibm-sm-deploy.vars.local.yml` / env | Fill `contentiq_secrets_manager_*` vars; run `check-ibm-sm-apikey-access.sh` |
-| Pull-secret credentials missing | `contentiq_manage_pull_secret=true` but empty `parameters.yml` registry fields | Set username/password/email or use SM mode |
+| Pull-secret credentials missing | `contentiq_manage_pull_secret=true`, `contentiq_fetch_secrets_from_ibm_sm=false`, empty registry fields (common on TechZone when `parameters.yml` is absent) | Use `playbooks/techzone-deploy.vars.example.yml` in `custom_values` (`parameters` key) or `post_deploy_override_variables`; or pass registry creds; playbook auto-disables Step 2 when creds are empty |
 | `ingress.config/cluster` domain unreadable | Not logged in or non-OpenShift cluster | `oc login`; or `contentiq_auto_route_hostnames: false` and set CR hostnames manually |
 | `__CONTENTIQ_*__` placeholders still present | Auto hostnames disabled but manifests not edited | Enable auto hostnames or replace placeholders in CR |
 
