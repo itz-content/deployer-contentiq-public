@@ -227,6 +227,9 @@
     contentiq_align_backend_secret_to_live_routes: true
     contentiq_align_backend_oauth_redirects: true
     contentiq_step6b_wait_backend_rollout_after_align: true
+    # After Routes exist: optionally register callback URLs in Azure via Graph (auto when AZURE_GRAPH_* in SM).
+    # false | true | auto — see DEPLOYMENT-CONFIG.md "OAuth redirect URI automation".
+    contentiq_sync_oauth_redirect_uris_to_providers: auto
 
     # Frontend /env.json: operator sets ONPREM_API_URL; image 1.3.x reads CONTENTIQ_API_BASE_URL.
     # InitContainer + emptyDir avoids PermissionError writing /srv/app/env.json under restricted SCC.

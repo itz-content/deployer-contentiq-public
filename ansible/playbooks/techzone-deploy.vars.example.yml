@@ -23,6 +23,9 @@
 contentiq_fetch_secrets_from_ibm_sm: true
 contentiq_manage_pull_secret: false
 
+# OAuth: auto-register each reservation's Microsoft callback in Azure when AZURE_GRAPH_* are in IBM SM.
+# contentiq_sync_oauth_redirect_uris_to_providers: auto
+
 # Optional: skip OSB Step 9 in lab when broker secret is not configured
 # contentiq_skip_osb_provision: true
 

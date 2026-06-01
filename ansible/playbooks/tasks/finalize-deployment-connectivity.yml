@@ -20,6 +20,10 @@
     contentiq_align_backend_wait_rollout_after_patch: "{{ contentiq_step6b_wait_backend_rollout_after_align | bool }}"
   when: contentiq_align_backend_secret_to_live_routes | bool
 
+- name: "Finalize: Register OAuth redirect URIs with external providers (Azure Graph)"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/sync-oauth-provider-redirect-uris.yml"
+  when: (contentiq_sync_oauth_redirect_uris_to_providers | default('auto') | string | lower) != 'false'
+
 - name: "Finalize: Align frontend /env.json and playground stream timeout"
   ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/align-frontend-runtime-config.yml"
   when: contentiq_align_frontend_runtime_config | bool

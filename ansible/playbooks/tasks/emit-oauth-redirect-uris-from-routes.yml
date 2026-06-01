@@ -1,0 +1,27 @@
+---
+# Build OAuth callback URLs from live OpenShift Routes (backend host).
+
+- name: "OAuth emit: Wait for backend route hostname"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - route
+      - contentiq-backend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.spec.host}
+  register: contentiq_oauth_backend_route
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_oauth_backend_route.stdout | trim | length > 0
+
+- name: "OAuth emit: Set redirect URIs from live backend route"
+  ansible.builtin.set_fact:
+    contentiq_oauth_backend_host: "{{ contentiq_oauth_backend_route.stdout | trim }}"
+    contentiq_oauth_redirect_uris:
+      microsoft: "https://{{ contentiq_oauth_backend_route.stdout | trim }}/api/connections/microsoft/auth/microsoft/callback"
+      google: "https://{{ contentiq_oauth_backend_route.stdout | trim }}/api/connections/googledrive/auth/google/callback"
+      box: "https://{{ contentiq_oauth_backend_route.stdout | trim }}/api/connections/box/auth/box/callback"
