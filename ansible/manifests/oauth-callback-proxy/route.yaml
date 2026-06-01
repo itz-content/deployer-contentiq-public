@@ -1,0 +1,18 @@
+# Public hostname for Google/Box OAuth callbacks (register these paths in GCP + Box consoles).
+# Override host: ROUTE_HOST=oauth.example.com ./scripts/deploy-oauth-callback-proxy.sh
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: contentiq-oauth-callback-proxy
+  labels:
+    app: contentiq-oauth-callback-proxy
+spec:
+  host: oauth.contentiq.symplistic.ai
+  to:
+    kind: Service
+    name: contentiq-oauth-callback-proxy
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

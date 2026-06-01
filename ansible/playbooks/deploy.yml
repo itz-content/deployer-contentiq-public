@@ -230,6 +230,11 @@
     # After Routes exist: optionally register callback URLs in Azure via Graph (auto when AZURE_GRAPH_* in SM).
     # false | true | auto — see DEPLOYMENT-CONFIG.md "OAuth redirect URI automation".
     contentiq_sync_oauth_redirect_uris_to_providers: auto
+    # Google/Box: fixed platform callback (one URI in GCP + Box consoles; proxy forwards to reservation backend).
+    # Set in TechZone vars or IBM SM (OAUTH_CALLBACK_PROXY_BASE). Empty = legacy per-reservation redirect URIs.
+    contentiq_oauth_fixed_callback_base: ""
+    contentiq_oauth_fixed_google_redirect_uri: ""
+    contentiq_oauth_fixed_box_redirect_uri: ""
 
     # Frontend /env.json: operator sets ONPREM_API_URL; image 1.3.x reads CONTENTIQ_API_BASE_URL.
     # InitContainer + emptyDir avoids PermissionError writing /srv/app/env.json under restricted SCC.
@@ -828,8 +833,19 @@
         contentiq_derived_backend_url: "https://{{ contentiq_route_backend_host }}"
         contentiq_derived_session_cookie_domain: "{{ contentiq_route_frontend_host | regex_replace('^[^.]+', '') }}"
         contentiq_derived_microsoft_redirect: "{{ ('https://' ~ contentiq_route_backend_host) ~ '/api/connections/microsoft/auth/microsoft/callback' }}"
-        contentiq_derived_box_redirect: "{{ ('https://' ~ contentiq_route_backend_host) ~ '/api/connections/box/auth/box/callback' }}"
-        contentiq_derived_google_redirect: "{{ ('https://' ~ contentiq_route_backend_host) ~ '/api/connections/googledrive/auth/google/callback' }}"
+      when: contentiq_auto_route_hostnames | bool
+
+    - name: Resolve Google and Box OAuth redirect URIs for rendered backend secret
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/resolve-oauth-redirect-uris.yml"
+      vars:
+        contentiq_oauth_backend_host: "{{ contentiq_route_backend_host }}"
+      when: contentiq_auto_route_hostnames | bool
+
+    - name: Set rendered Google/Box redirect placeholders from resolved OAuth URIs
+      ansible.builtin.set_fact:
+        contentiq_derived_google_redirect: "{{ contentiq_oauth_redirect_uris.google }}"
+        contentiq_derived_box_redirect: "{{ contentiq_oauth_redirect_uris.box }}"
+        contentiq_derived_oauth_callback_proxy_base: "{{ contentiq_oauth_google_box_secret_patch.OAUTH_CALLBACK_PROXY_BASE | default('') }}"
       when: contentiq_auto_route_hostnames | bool
 
     - name: Copy backend secret manifest for placeholder substitution
@@ -864,6 +880,7 @@
         - { regexp: '__CONTENTIQ_MICROSOFT_REDIRECT_URI__', replace: "{{ contentiq_derived_microsoft_redirect }}" }
         - { regexp: '__CONTENTIQ_BOX_REDIRECT_URI__', replace: "{{ contentiq_derived_box_redirect }}" }
         - { regexp: '__CONTENTIQ_GOOGLE_REDIRECT_URI__', replace: "{{ contentiq_derived_google_redirect }}" }
+        - { regexp: '__CONTENTIQ_OAUTH_CALLBACK_PROXY_BASE__', replace: "{{ contentiq_derived_oauth_callback_proxy_base | default('') }}" }
       when:
         - contentiq_auto_route_hostnames | bool
         - not (contentiq_fetch_secrets_from_ibm_sm | default(false) | bool)
@@ -1028,14 +1045,17 @@
         contentiq_step6b_be: "{{ contentiq_step6b_backend_route.stdout | trim }}"
       when: contentiq_align_backend_secret_to_live_routes | bool
 
+    - name: "Step 6b: Resolve Google and Box OAuth redirect URIs"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/resolve-oauth-redirect-uris.yml"
+      vars:
+        contentiq_oauth_backend_host: "{{ contentiq_step6b_backend_route.stdout | trim }}"
+      when:
+        - contentiq_align_backend_secret_to_live_routes | bool
+        - contentiq_align_backend_oauth_redirects | bool
+
     - name: "Step 6b: Append Google and Box OAuth redirect URIs to route alignment"
       ansible.builtin.set_fact:
-        contentiq_step6b_live_route_secret_stringdata: "{{ contentiq_step6b_live_route_secret_stringdata | combine(contentiq_step6b_oauth_extra) }}"
-      vars:
-        contentiq_step6b_oauth_extra:
-          GOOGLE_REDIRECT_URI: "https://{{ contentiq_step6b_be }}/api/connections/googledrive/auth/google/callback"
-          BOX_REDIRECT_URI: "https://{{ contentiq_step6b_be }}/api/connections/box/auth/box/callback"
-        contentiq_step6b_be: "{{ contentiq_step6b_backend_route.stdout | trim }}"
+        contentiq_step6b_live_route_secret_stringdata: "{{ contentiq_step6b_live_route_secret_stringdata | combine(contentiq_oauth_google_box_secret_patch) }}"
       when:
         - contentiq_align_backend_secret_to_live_routes | bool
         - contentiq_align_backend_oauth_redirects | bool

@@ -31,6 +31,19 @@
       ansible.builtin.debug:
         msg: "{{ contentiq_oauth_microsoft_sync_cmd.stdout | trim }}"
 
+- name: "OAuth sync: Summarize Google/Box fixed-callback mode"
+  ansible.builtin.debug:
+    msg:
+      - "Google/Box use fixed platform OAuth callback (register once in GCP + Box consoles):"
+      - "  Google: {{ contentiq_oauth_redirect_uris.google }}"
+      - "  Box:    {{ contentiq_oauth_redirect_uris.box }}"
+      - "Microsoft (per reservation, Graph auto-register when AZURE_GRAPH_* in SM):"
+      - "  Microsoft: {{ contentiq_oauth_redirect_uris.microsoft }}"
+  when:
+    - contentiq_oauth_redirect_uris is defined
+    - contentiq_oauth_use_fixed_google_box_callback | default(false) | bool
+    - contentiq_oauth_sync_mode != 'false'
+
 - name: "OAuth sync: Remind operators to register URIs manually when automation is off"
   ansible.builtin.debug:
     msg:
@@ -40,7 +53,9 @@
       - "  Google:    {{ contentiq_oauth_redirect_uris.google }}"
       - "  Box:       {{ contentiq_oauth_redirect_uris.box }}"
       - "Or store AZURE_GRAPH_CLIENT_ID + AZURE_GRAPH_CLIENT_SECRET + AZURE_TENANT_ID in IBM SM once; redeploy will auto-register Microsoft."
+      - "For hands-off Google/Box on TechZone, set contentiq_oauth_fixed_callback_base (see DEPLOYMENT-CONFIG.md)."
   when:
     - not (contentiq_oauth_microsoft_sync_enabled | bool)
+    - not (contentiq_oauth_use_fixed_google_box_callback | default(false) | bool)
     - contentiq_oauth_redirect_uris is defined
     - contentiq_oauth_sync_mode != 'false'

@@ -1,0 +1,55 @@
+# Platform one-time deploy — forwards Google/Box OAuth callbacks to TechZone reservation backends.
+# Apply: ./scripts/deploy-oauth-callback-proxy.sh
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: contentiq-oauth-callback-proxy
+  labels:
+    app: contentiq-oauth-callback-proxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: contentiq-oauth-callback-proxy
+  template:
+    metadata:
+      labels:
+        app: contentiq-oauth-callback-proxy
+    spec:
+      containers:
+        - name: proxy
+          image: python:3.12-alpine
+          command:
+            - python3
+            - /app/proxy.py
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: proxy-script
+              mountPath: /app
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: proxy-script
+          configMap:
+            name: contentiq-oauth-callback-proxy
+            defaultMode: 0555
