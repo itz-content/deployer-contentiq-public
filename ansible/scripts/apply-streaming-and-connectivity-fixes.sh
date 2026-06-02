@@ -88,22 +88,40 @@ curl -sk -D - -o /dev/null -H "Origin: ${FRONTEND_ORIGIN}" \
   "${BACKEND_ORIGIN}/api/support/health" | grep -iE 'HTTP/|access-control-allow-origin' || true
 
 echo ""
-echo "=== 7) LAKEHOUSE_INGRESS_PORT from edge-gateway Service (when present) ==="
+echo "=== 7) Lakehouse backend secret (host, port, token) when edge-gateway present ==="
 if "${OC}" get svc edge-gateway -n "${NS}" >/dev/null 2>&1; then
   EG_PORT="$("${OC}" get svc edge-gateway -n "${NS}" -o jsonpath='{.spec.ports[0].port}')"
   CUR_PORT="$("${OC}" get secret contentiq-backend-secrets -n "${NS}" \
     -o jsonpath='{.data.LAKEHOUSE_INGRESS_PORT}' 2>/dev/null | base64 -d 2>/dev/null || true)"
-  if [[ "${CUR_PORT}" != "${EG_PORT}" ]]; then
-    echo "Patching LAKEHOUSE_INGRESS_PORT=${EG_PORT} and restarting backend..."
-    "${OC}" patch secret contentiq-backend-secrets -n "${NS}" --type=merge \
-      -p "{\"stringData\":{\"LAKEHOUSE_INGRESS_PORT\":\"${EG_PORT}\"}}"
+  CUR_HOST="$("${OC}" get secret contentiq-backend-secrets -n "${NS}" \
+    -o jsonpath='{.data.LAKEHOUSE_INGRESS_HOST}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+  SERVICE_TOKEN="$("${OC}" get secret lakekeeper-auth-tokens -n "${NS}" \
+    -o jsonpath='{.data.SERVICE_TOKEN}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+  CUR_TOKEN="$("${OC}" get secret contentiq-backend-secrets -n "${NS}" \
+    -o jsonpath='{.data.LAKEHOUSE_SERVICE_TOKEN}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+  NEED_PATCH=0
+  if [[ "${CUR_HOST}" != "edge-gateway" ]]; then NEED_PATCH=1; fi
+  if [[ "${CUR_PORT}" != "${EG_PORT}" ]]; then NEED_PATCH=1; fi
+  if [[ -n "${SERVICE_TOKEN}" && "${CUR_TOKEN}" != "${SERVICE_TOKEN}" ]]; then NEED_PATCH=1; fi
+  if [[ "${NEED_PATCH}" -eq 1 ]]; then
+    echo "Patching lakehouse secret (host=${CUR_HOST:-<empty>} port=${CUR_PORT:-<empty>}) and restarting backend..."
+    EG_PORT="${EG_PORT}" SERVICE_TOKEN="${SERVICE_TOKEN}" \
+      "${OC}" patch secret contentiq-backend-secrets -n "${NS}" --type=merge -p "$(EG_PORT="${EG_PORT}" SERVICE_TOKEN="${SERVICE_TOKEN}" python3 - <<'PY'
+import json, os
+payload = {"stringData": {"LAKEHOUSE_INGRESS_HOST": "edge-gateway", "LAKEHOUSE_INGRESS_PORT": os.environ["EG_PORT"]}}
+tok = os.environ.get("SERVICE_TOKEN", "").strip()
+if tok:
+    payload["stringData"]["LAKEHOUSE_SERVICE_TOKEN"] = tok
+print(json.dumps(payload))
+PY
+)"
     "${OC}" rollout restart deployment/contentiq-backend -n "${NS}"
     "${OC}" rollout status deployment/contentiq-backend -n "${NS}" --timeout=600s
   else
-    echo "OK: LAKEHOUSE_INGRESS_PORT=${CUR_PORT}"
+    echo "OK: LAKEHOUSE_INGRESS_HOST=edge-gateway LAKEHOUSE_INGRESS_PORT=${CUR_PORT} token aligned"
   fi
 else
-  echo "Skipping lakehouse port patch (edge-gateway Service not found)."
+  echo "Skipping lakehouse secret patch (edge-gateway Service not found)."
 fi
 
 echo ""
