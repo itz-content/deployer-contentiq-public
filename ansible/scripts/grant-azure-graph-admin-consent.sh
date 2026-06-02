@@ -5,28 +5,41 @@
 # Prerequisites:
 #   az login   # account that can grant admin consent in the tenant
 #   Automation app already exists with API permission added in portal OR via this script
+#   AZURE_GRAPH_CLIENT_ID in ansible/secrets/backend-secrets-template.yaml
 #
 # Usage:
 #   ./ansible/scripts/grant-azure-graph-admin-consent.sh
 #   AUTOMATION_APP_ID=d5d64d68-b118-45a0-a270-f5d326897f38 ./ansible/scripts/grant-azure-graph-admin-consent.sh
 #
-# Optional: load automation app id from azure-graph.env
-#   source ansible/scripts/azure-graph.env && ./ansible/scripts/grant-azure-graph-admin-consent.sh
-#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${AZURE_GRAPH_ENV_FILE:-${SCRIPT_DIR}/azure-graph.env}"
-if [[ -f "${ENV_FILE}" ]]; then
-  # shellcheck disable=SC1090
-  set -a
-  source "${ENV_FILE}"
-  set +a
-fi
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+TEMPLATE="${ROOT}/secrets/backend-secrets-template.yaml"
 
+read_template_key() {
+  python3 - "${TEMPLATE}" "$1" <<'PY'
+import re
+import sys
+
+path, key = sys.argv[1], sys.argv[2]
+pat = re.compile(rf"^  {re.escape(key)}:\s*\"(.*)\"\s*$")
+for line in open(path, encoding="utf-8"):
+    m = pat.match(line.rstrip("\n"))
+    if m:
+        print(m.group(1))
+        break
+PY
+}
+
+AUTOMATION_APP_ID="${AUTOMATION_APP_ID:-}"
+if [[ -z "${AUTOMATION_APP_ID}" && -f "${TEMPLATE}" ]]; then
+  AUTOMATION_APP_ID="$(read_template_key AZURE_GRAPH_CLIENT_ID || true)"
+fi
 AUTOMATION_APP_ID="${AUTOMATION_APP_ID:-${AZURE_GRAPH_CLIENT_ID:-}}"
+
 if [[ -z "${AUTOMATION_APP_ID}" ]]; then
-  echo "Set AUTOMATION_APP_ID or AZURE_GRAPH_CLIENT_ID (automation app, not MS_CLIENT_ID)." >&2
+  echo "Set AUTOMATION_APP_ID or add AZURE_GRAPH_CLIENT_ID to ${TEMPLATE}." >&2
   exit 1
 fi
 
