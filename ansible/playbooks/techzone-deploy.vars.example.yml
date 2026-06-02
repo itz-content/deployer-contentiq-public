@@ -1,0 +1,45 @@
+---
+# TechZone / deployer custom_values — Ansible parameters file (no secrets).
+#
+# In TechZone Terraform overrides → custom_values, reference this file from the release tag:
+#
+#   {
+#     "deployer": {
+#       "public": true,
+#       "repoName": "deployer-contentiq-public",
+#       "release": "contentiq-1.0.0-ansible",
+#       "parameters": "ansible/playbooks/techzone-deploy.vars.example.yml",
+#       "ansible": {
+#         "ansiblePlaybook": "ansible/playbooks/deploy.yml"
+#       }
+#     }
+#   }
+#
+# Or pass the same keys via Terraform override post_deploy_override_variables (JSON string).
+#
+# IBM Secrets Manager path (default for TechZone OCP on IBM Cloud): uses kube-system/ibm-secret
+# for IAM when IBM_CLOUD_API_KEY is unset. Override SM endpoint/UUIDs if not using playbook defaults.
+
+contentiq_fetch_secrets_from_ibm_sm: true
+contentiq_manage_pull_secret: false
+
+# OAuth: auto-register each reservation's Microsoft callback in Azure when AZURE_GRAPH_* are in IBM SM.
+# contentiq_sync_oauth_redirect_uris_to_providers: auto
+
+# Google/Box: fixed platform OAuth callback (defaults also in deploy.yml).
+# One-time platform setup: oauth-callback-proxy + GCP/Box console redirect URIs on oauth.contentiq.symplistic.ai
+# One-time IBM SM (all connector creds + redirect URIs — on-prem has no local secrets templates):
+#   ./playbooks/scripts/add-platform-oauth-keys-to-ibm-sm-backend.sh --sync-cluster
+# Per deploy: playbook pulls SM (Step 1b) and patches fixed redirect URIs + live routes (Step 6b).
+contentiq_oauth_fixed_callback_base: "https://oauth.contentiq.symplistic.ai"
+# contentiq_oauth_fixed_google_redirect_uri: ""
+# contentiq_oauth_fixed_box_redirect_uri: ""
+
+# Optional: skip OSB Step 9 in lab when broker secret is not configured
+# contentiq_skip_osb_provision: true
+
+# --- Local disk secrets (no IBM SM) — only if you pre-fill ansible/secrets/*.yaml in the release:
+# contentiq_use_local_secrets: true
+# contentiq_fetch_secrets_from_ibm_sm: false
+# contentiq_manage_pull_secret: false
+# contentiq_merge_platform_oauth_from_template: true   # lab only: overlay from backend-secrets-template.yaml

@@ -1,10 +1,33 @@
 ---
 # Included with loop: rollout_dep_name, rollout_dep_idx, rollout_dep_list (full list for last-item check).
+- name: "Step 6: Re-assert frontend patch if operator reverted or pods CrashLoop"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/reassert-frontend-runtime-patch-if-needed.yml"
+
+- name: "Step 6: Apply frontend initContainer patch before rollout wait (prevents CrashLoopBackOff)"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/ensure-frontend-runtime-patch.yml"
+  vars:
+    contentiq_frontend_patch_restart_after_apply: true
+    contentiq_frontend_patch_wait_rollout: false
+  when:
+    - rollout_dep_name == 'contentiq-frontend'
+    - contentiq_align_frontend_runtime_config | default(false) | bool
+    - contentiq_frontend_apply_runtime_config_patch | default(false) | bool
+    - contentiq_frontend_patch_before_rollout | default(true) | bool
+    - not (contentiq_frontend_early_patch_done | default(false) | bool)
+
 - name: "Step 6: Ensure progress deadline before deployment rollout wait"
   ansible.builtin.include_tasks: patch_deployment_min_progress_deadline.yml
   vars:
     patch_dep_name: "{{ rollout_dep_name }}"
     patch_dep_namespace: "{{ contentiq_namespace }}"
+
+- name: "Step 6: Wait for frontend rollout with initContainer guard (operator reconcile)"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/wait-frontend-rollout-with-runtime-patch.yml"
+  when:
+    - rollout_dep_name == 'contentiq-frontend'
+    - contentiq_align_frontend_runtime_config | default(false) | bool
+    - contentiq_frontend_apply_runtime_config_patch | default(false) | bool
+    - contentiq_frontend_rollout_guard_enabled | default(true) | bool
 
 - name: "Step 6: Wait for deployment rollout (first attempt)"
   ansible.builtin.command:
@@ -16,14 +39,49 @@
       - -n
       - "{{ contentiq_namespace }}"
       - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
-  register: contentiq_rollout_status_result
+  register: contentiq_rollout_cmd_result
   changed_when: false
   failed_when: false
+  when: >-
+    rollout_dep_name != 'contentiq-frontend'
+    or not (contentiq_align_frontend_runtime_config | default(false) | bool)
+    or not (contentiq_frontend_apply_runtime_config_patch | default(false) | bool)
+    or not (contentiq_frontend_rollout_guard_enabled | default(true) | bool)
+
+# Skipped oc rollout status must not overwrite guard/cmd results (skipped dict has no .rc).
+- name: "Step 6: Resolve effective rollout wait result (frontend guard vs oc rollout status)"
+  ansible.builtin.set_fact:
+    contentiq_rollout_status_result: "{{ _contentiq_rollout_effective }}"
+  vars:
+    _contentiq_use_frontend_guard: >-
+      {{
+        rollout_dep_name == 'contentiq-frontend'
+        and (contentiq_align_frontend_runtime_config | default(false) | bool)
+        and (contentiq_frontend_apply_runtime_config_patch | default(false) | bool)
+        and (contentiq_frontend_rollout_guard_enabled | default(true) | bool)
+      }}
+    _contentiq_rollout_effective: >-
+      {{
+        contentiq_frontend_rollout_guard_result
+        if (
+          _contentiq_use_frontend_guard
+          and (contentiq_frontend_rollout_guard_result is defined)
+          and not (contentiq_frontend_rollout_guard_result.skipped | default(false))
+        )
+        else (
+          contentiq_rollout_cmd_result
+          if (
+            contentiq_rollout_cmd_result is defined
+            and not (contentiq_rollout_cmd_result.skipped | default(false))
+          )
+          else {'rc': 0, 'stderr': '', 'stdout': ''}
+        )
+      }}
 
 - name: "Step 6: Recover stuck rollout after progress deadline exceeded"
   when:
     - contentiq_rollout_recover_on_progress_deadline | default(true) | bool
-    - contentiq_rollout_status_result.rc != 0
+    - (contentiq_rollout_status_result.rc | default(0)) != 0
     - "'deadline' in (contentiq_rollout_status_result.stderr | default('') | lower)"
   block:
     - name: "Step 6: rollout restart after progress deadline"
@@ -53,13 +111,47 @@
           - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
       changed_when: false
 
+- name: "Step 6: Detect frontend CrashLoopBackOff during rollout wait"
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      reasons=$("{{ contentiq_oc_binary }}" get pods -n "{{ contentiq_namespace }}" \
+        -l app=contentiq-frontend \
+        -o jsonpath='{range .items[*]}{.status.containerStatuses[?(@.name=="frontend")].state.waiting.reason}{" "}{end}' 2>/dev/null || true)
+      if echo "${reasons}" | grep -q CrashLoopBackOff; then exit 0; fi
+      exit 1
+    executable: /bin/bash
+  register: contentiq_rollout_frontend_crashloop
+  failed_when: false
+  changed_when: false
+  when:
+    - rollout_dep_name == 'contentiq-frontend'
+    - contentiq_align_frontend_runtime_config | default(false) | bool
+    - contentiq_frontend_apply_runtime_config_patch | default(false) | bool
+
+- name: "Step 6: Recover frontend CrashLoopBackOff (initContainer / env.json patch)"
+  when:
+    - rollout_dep_name == 'contentiq-frontend'
+    - contentiq_align_frontend_runtime_config | default(false) | bool
+    - contentiq_frontend_apply_runtime_config_patch | default(false) | bool
+    - not (contentiq_frontend_rollout_guard_enabled | default(true) | bool)
+    - >-
+      (contentiq_rollout_status_result.rc | default(0)) != 0
+      or contentiq_rollout_frontend_crashloop.rc == 0
+  block:
+    - name: "Step 6: Re-apply frontend runtime patch after failed rollout"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/ensure-frontend-runtime-patch.yml"
+      vars:
+        contentiq_frontend_patch_restart_after_apply: true
+        contentiq_frontend_patch_wait_rollout: true
+
 - name: "Step 6: Fail if deployment rollout did not succeed"
   ansible.builtin.fail:
     msg: >-
       Rollout failed for deployment/{{ rollout_dep_name }} in namespace {{ contentiq_namespace }}.
-      First attempt rc={{ contentiq_rollout_status_result.rc }} stderr={{ contentiq_rollout_status_result.stderr | default('') }}
+      First attempt rc={{ contentiq_rollout_status_result.rc | default('n/a') }} stderr={{ contentiq_rollout_status_result.stderr | default('') }}
   when:
-    - contentiq_rollout_status_result.rc != 0
+    - (contentiq_rollout_status_result.rc | default(0)) != 0
     - not (
         (contentiq_rollout_recover_on_progress_deadline | default(true) | bool)
         and ('deadline' in (contentiq_rollout_status_result.stderr | default('') | lower))

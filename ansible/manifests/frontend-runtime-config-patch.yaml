@@ -1,0 +1,51 @@
+# Operator sets ONPREM_API_URL on frontend-config; image 1.3.x reads CONTENTIQ_API_BASE_URL.
+# InitContainer writes env.json to emptyDir; main container serves it at /srv/app/env.json.
+# Main must use CONTENTIQ_RUNTIME_CONFIG_PATH=/config/env.json — writing /srv/app/env.json
+# directly fails under random UID (PermissionError) without the emptyDir mount.
+#
+# Apply after ContentIQ is up (re-apply if operator reconcile drops initContainers):
+#   oc patch deployment contentiq-frontend -n contentiq --patch-file ansible/manifests/frontend-runtime-config-patch.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: contentiq-frontend
+  namespace: contentiq
+spec:
+  template:
+    spec:
+      volumes:
+        - name: frontend-runtime-config
+          emptyDir: {}
+      initContainers:
+        - name: render-frontend-env-json
+          image: docker.io/symplisticai/contentiq-frontend:1.3.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              if [ -z "${CONTENTIQ_API_BASE_URL:-}" ] && [ -n "${ONPREM_API_URL:-}" ]; then
+                export CONTENTIQ_API_BASE_URL="${ONPREM_API_URL}"
+              fi
+              export CONTENTIQ_RUNTIME_CONFIG_PATH=/config/env.json
+              export CONTENTIQ_PLAYGROUND_STREAM_TIMEOUT_SECONDS="${CONTENTIQ_PLAYGROUND_STREAM_TIMEOUT_SECONDS:-1800}"
+              python /srv/app/on_prem_packaging/render_runtime_config.py
+              chmod 644 /config/env.json
+          envFrom:
+            - configMapRef:
+                name: frontend-config
+          volumeMounts:
+            - name: frontend-runtime-config
+              mountPath: /config
+      containers:
+        - name: frontend
+          env:
+            - name: CONTENTIQ_RUNTIME_CONFIG_PATH
+              value: /config/env.json
+          volumeMounts:
+            - name: frontend-runtime-config
+              mountPath: /config
+            - name: frontend-runtime-config
+              mountPath: /srv/app/env.json
+              subPath: env.json

@@ -1,0 +1,45 @@
+---
+# Fail when app Routes lack the expected HAProxy timeout (operator reconcile may strip annotations).
+
+- name: "Route assert: Read timeout on contentiq-backend Route"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - route
+      - contentiq-backend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.metadata.annotations.haproxy\.router\.openshift\.io/timeout}
+  register: contentiq_route_assert_backend_timeout
+  changed_when: false
+  failed_when: false
+
+- name: "Route assert: Read timeout on contentiq-frontend Route"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - route
+      - contentiq-frontend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.metadata.annotations.haproxy\.router\.openshift\.io/timeout}
+  register: contentiq_route_assert_frontend_timeout
+  changed_when: false
+  failed_when: false
+
+- name: "Route assert: HAProxy timeout present on app Routes"
+  ansible.builtin.assert:
+    that:
+      - contentiq_route_assert_backend_timeout.stdout | trim == contentiq_route_haproxy_timeout
+      - contentiq_route_assert_frontend_timeout.stdout | trim == contentiq_route_haproxy_timeout
+    fail_msg: >-
+      Route HAProxy timeout must be {{ contentiq_route_haproxy_timeout }} on contentiq-frontend and
+      contentiq-backend. Got backend={{ contentiq_route_assert_backend_timeout.stdout | trim | default('(none)') }},
+      frontend={{ contentiq_route_assert_frontend_timeout.stdout | trim | default('(none)') }}.
+      The operator may have recreated Routes after Step 6d; re-run finalize or
+      ./scripts/apply-streaming-and-connectivity-fixes.sh.
+  when: contentiq_assert_route_timeouts | bool

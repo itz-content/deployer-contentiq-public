@@ -1,0 +1,26 @@
+---
+# Build OAuth callback URLs for provider sync and operator messages.
+# Microsoft: per-reservation backend route (Graph auto-register).
+# Google/Box: fixed platform callback when contentiq_oauth_fixed_callback_base is set.
+
+- name: "OAuth emit: Wait for backend route hostname"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - route
+      - contentiq-backend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.spec.host}
+  register: contentiq_oauth_backend_route
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_oauth_backend_route.stdout | trim | length > 0
+
+- name: "OAuth emit: Resolve redirect URIs from backend route and fixed-callback config"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/resolve-oauth-redirect-uris.yml"
+  vars:
+    contentiq_oauth_backend_host: "{{ contentiq_oauth_backend_route.stdout | trim }}"

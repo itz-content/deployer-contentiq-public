@@ -1,0 +1,200 @@
+---
+# Idempotent fix for frontend CrashLoopBackOff (PermissionError on /srv/app/env.json).
+# Applies frontend-config keys + strategic deployment patch (initContainer + emptyDir).
+# Include before contentiq-frontend rollout wait and again in finalize alignment.
+
+- name: "Frontend patch: Wait for contentiq-frontend deployment"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - deployment
+      - contentiq-frontend
+      - -n
+      - "{{ contentiq_namespace }}"
+  register: contentiq_frontend_patch_dep_wait
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_frontend_patch_dep_wait.rc == 0
+
+- name: "Frontend patch: Wait for frontend route hostname"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - route
+      - contentiq-frontend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.spec.host}
+  register: contentiq_frontend_patch_fe_route
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_frontend_patch_fe_route.stdout | trim | length > 0
+
+- name: "Frontend patch: Wait for backend route hostname"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - route
+      - contentiq-backend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.spec.host}
+  register: contentiq_frontend_patch_be_route
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_frontend_patch_be_route.stdout | trim | length > 0
+
+- name: "Frontend patch: Set backend API URL from live route"
+  ansible.builtin.set_fact:
+    contentiq_frontend_patch_backend_api_url: "https://{{ contentiq_frontend_patch_be_route.stdout | trim }}"
+
+- name: "Frontend patch: Wait for frontend-config ConfigMap"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - configmap
+      - frontend-config
+      - -n
+      - "{{ contentiq_namespace }}"
+  register: contentiq_frontend_patch_cm_wait
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_frontend_patch_cm_wait.rc == 0
+
+- name: "Frontend patch: Merge-patch frontend-config (CONTENTIQ_* and ONPREM_API_URL)"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - patch
+      - configmap
+      - frontend-config
+      - -n
+      - "{{ contentiq_namespace }}"
+      - --type=merge
+      - -p
+      - >-
+        {{
+          {
+            'data': {
+              'CONTENTIQ_API_BASE_URL': contentiq_frontend_patch_backend_api_url,
+              'ONPREM_API_URL': contentiq_frontend_patch_backend_api_url,
+              'CONTENTIQ_PLAYGROUND_STREAM_TIMEOUT_SECONDS': (contentiq_frontend_playground_stream_timeout_seconds | string)
+            }
+          } | to_json
+        }}
+  register: contentiq_frontend_patch_cm_apply
+  changed_when: >-
+    'patched' in contentiq_frontend_patch_cm_apply.stdout | default('')
+    or 'configured' in contentiq_frontend_patch_cm_apply.stdout | default('')
+
+- name: "Frontend patch: Read initContainer names before strategic patch"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - deployment
+      - contentiq-frontend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.spec.template.spec.initContainers[*].name}
+  register: contentiq_frontend_patch_init_before
+  changed_when: false
+  when: contentiq_frontend_apply_runtime_config_patch | bool
+
+- name: "Frontend patch: Apply strategic patch until render-frontend-env-json initContainer sticks"
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      PATCH_FILE="{{ contentiq_frontend_runtime_config_patch_manifest }}"
+      NS="{{ contentiq_namespace }}"
+      OC="{{ contentiq_oc_binary }}"
+      RETRIES={{ contentiq_frontend_patch_assert_retries | default(12) }}
+      DELAY={{ contentiq_frontend_patch_assert_delay_seconds | default(5) }}
+      has_init() {
+        "${OC}" get deployment contentiq-frontend -n "${NS}" \
+          -o jsonpath='{.spec.template.spec.initContainers[*].name}' 2>/dev/null \
+          | grep -q 'render-frontend-env-json'
+      }
+      patched=0
+      for attempt in $(seq 1 "${RETRIES}"); do
+        if ! has_init; then
+          "${OC}" patch deployment contentiq-frontend -n "${NS}" \
+            --type=strategic --patch-file "${PATCH_FILE}"
+          patched=1
+        fi
+        if has_init; then
+          echo "initContainer present (attempt ${attempt}/${RETRIES})"
+          exit 0
+        fi
+        if [ "${attempt}" -lt "${RETRIES}" ]; then
+          sleep "${DELAY}"
+        fi
+      done
+      echo "FAIL: deployment still missing initContainer render-frontend-env-json after ${RETRIES} attempts (operator may be reconciling)" >&2
+      exit 1
+    executable: /bin/bash
+  register: contentiq_frontend_patch_dep_apply
+  changed_when: >-
+    'patched' in (contentiq_frontend_patch_dep_apply.stdout | default(''))
+    or 'render-frontend-env-json' not in (contentiq_frontend_patch_init_before.stdout | default(''))
+  when: contentiq_frontend_apply_runtime_config_patch | bool
+
+- name: "Frontend patch: Read initContainer names after strategic patch"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - deployment
+      - contentiq-frontend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.spec.template.spec.initContainers[*].name}
+  register: contentiq_frontend_patch_init_after
+  changed_when: false
+  when: contentiq_frontend_apply_runtime_config_patch | bool
+
+- name: "Frontend patch: Restart frontend when initContainer was missing or patch changed"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - rollout
+      - restart
+      - deployment/contentiq-frontend
+      - -n
+      - "{{ contentiq_namespace }}"
+  register: contentiq_frontend_patch_restart
+  changed_when: true
+  when:
+    - contentiq_frontend_apply_runtime_config_patch | bool
+    - contentiq_frontend_patch_restart_after_apply | default(true) | bool
+    - >-
+      'render-frontend-env-json' not in (contentiq_frontend_patch_init_before.stdout | default(''))
+      or (contentiq_frontend_patch_dep_apply is changed)
+      or (contentiq_frontend_patch_cm_apply is changed)
+
+- name: "Frontend patch: Wait for frontend rollout after patch/restart"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - rollout
+      - status
+      - deployment/contentiq-frontend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - "--timeout={{ contentiq_step6c_frontend_ready_timeout_seconds }}s"
+  changed_when: false
+  when:
+    - contentiq_frontend_apply_runtime_config_patch | bool
+    - contentiq_frontend_patch_wait_rollout | default(false) | bool

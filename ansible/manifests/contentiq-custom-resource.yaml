@@ -49,10 +49,10 @@ spec:
   # Resource limits (optional overrides - defaults shown)
   backendResources:
     requests:
-      cpu: "1"
-      memory: "4Gi"
+      cpu: "12"
+      memory: "8Gi"
     limits:
-      cpu: "1"
+      cpu: "12"
       memory: "40Gi"
 
   frontendResources:
@@ -68,8 +68,8 @@ spec:
       cpu: "500m"
       memory: "2Gi"
     limits:
-      cpu: "2"
-      memory: "4Gi"
+      cpu: "4"
+      memory: "8Gi"
 
   # Redis: operator-managed by default. The operator injects REDIS_URL into backend and can use external Redis.
   # If you set redis.password, the operator updates the managed Redis secret and rolls Redis and backend pods to apply it.

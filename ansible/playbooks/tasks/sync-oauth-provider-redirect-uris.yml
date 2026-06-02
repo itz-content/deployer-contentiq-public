@@ -1,0 +1,61 @@
+---
+# Register per-reservation OAuth callback URLs with external identity providers.
+# Cluster secrets are aligned separately (Step 6b); this updates Azure app registration.
+
+- name: "OAuth sync: Resolve provider automation configuration"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/resolve-oauth-provider-sync-config.yml"
+
+- name: "OAuth sync: Resolve callback URLs from live Routes"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/emit-oauth-redirect-uris-from-routes.yml"
+  when: contentiq_oauth_redirect_uris is not defined
+
+- name: "OAuth sync: Register Microsoft redirect URI via Graph API"
+  when: contentiq_oauth_microsoft_sync_enabled | bool
+  block:
+    - name: "OAuth sync: Run Microsoft Graph redirect URI script"
+      ansible.builtin.command:
+        argv:
+          - "{{ playbook_dir }}/scripts/sync-microsoft-oauth-redirect-uri.sh"
+      environment:
+        TENANT_ID: "{{ contentiq_oauth_microsoft_tenant_id }}"
+        GRAPH_CLIENT_ID: "{{ contentiq_oauth_microsoft_graph_client_id }}"
+        GRAPH_CLIENT_SECRET: "{{ contentiq_oauth_microsoft_graph_client_secret }}"
+        TARGET_APP_ID: "{{ contentiq_oauth_microsoft_target_app_id }}"
+        REDIRECT_URI: "{{ contentiq_oauth_redirect_uris.microsoft }}"
+        DRY_RUN: "{{ contentiq_oauth_sync_dry_run | default(false) | string }}"
+      register: contentiq_oauth_microsoft_sync_cmd
+      changed_when: "'registered redirect URI' in (contentiq_oauth_microsoft_sync_cmd.stdout | default(''))"
+      no_log: true
+
+    - name: "OAuth sync: Microsoft registration result"
+      ansible.builtin.debug:
+        msg: "{{ contentiq_oauth_microsoft_sync_cmd.stdout | trim }}"
+
+- name: "OAuth sync: Summarize Google/Box fixed-callback mode"
+  ansible.builtin.debug:
+    msg:
+      - "Google/Box use fixed platform OAuth callback (register once in GCP + Box consoles):"
+      - "  Google: {{ contentiq_oauth_redirect_uris.google }}"
+      - "  Box:    {{ contentiq_oauth_redirect_uris.box }}"
+      - "Microsoft (per reservation, Graph auto-register when AZURE_GRAPH_* in SM):"
+      - "  Microsoft: {{ contentiq_oauth_redirect_uris.microsoft }}"
+  when:
+    - contentiq_oauth_redirect_uris is defined
+    - contentiq_oauth_use_fixed_google_box_callback | default(false) | bool
+    - contentiq_oauth_sync_mode != 'false'
+
+- name: "OAuth sync: Remind operators to register URIs manually when automation is off"
+  ansible.builtin.debug:
+    msg:
+      - "OAuth provider sync skipped (no AZURE_GRAPH_* automation credentials)."
+      - "Add these redirect URIs in Azure / Google / Box developer consoles for this reservation:"
+      - "  Microsoft: {{ contentiq_oauth_redirect_uris.microsoft }}"
+      - "  Google:    {{ contentiq_oauth_redirect_uris.google }}"
+      - "  Box:       {{ contentiq_oauth_redirect_uris.box }}"
+      - "Or store AZURE_GRAPH_CLIENT_ID + AZURE_GRAPH_CLIENT_SECRET + AZURE_TENANT_ID in IBM SM once; redeploy will auto-register Microsoft."
+      - "For hands-off Google/Box on TechZone, set contentiq_oauth_fixed_callback_base (see DEPLOYMENT-CONFIG.md)."
+  when:
+    - not (contentiq_oauth_microsoft_sync_enabled | bool)
+    - not (contentiq_oauth_use_fixed_google_box_callback | default(false) | bool)
+    - contentiq_oauth_redirect_uris is defined
+    - contentiq_oauth_sync_mode != 'false'

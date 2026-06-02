@@ -1,0 +1,125 @@
+---
+# Resolve whether to sync OAuth redirect URIs to Microsoft Graph (Azure portal).
+# contentiq_sync_oauth_redirect_uris_to_providers: false | true | auto
+#   auto (default): run when AZURE_GRAPH_* automation creds are present
+#   true: always run (fail if creds missing)
+#   false: never run
+
+- name: "OAuth resolve: Normalize sync mode"
+  ansible.builtin.set_fact:
+    contentiq_oauth_sync_mode: "{{ contentiq_sync_oauth_redirect_uris_to_providers | default('auto') | string | lower }}"
+
+- name: "OAuth resolve: Skip provider sync (disabled)"
+  ansible.builtin.set_fact:
+    contentiq_oauth_microsoft_sync_enabled: false
+  when: contentiq_oauth_sync_mode == 'false'
+
+- name: "OAuth resolve: Load automation keys from backend secret"
+  when: contentiq_oauth_sync_mode in ['auto', 'true']
+  block:
+    - name: "OAuth resolve: Secret keys for provider automation"
+      ansible.builtin.set_fact:
+        contentiq_oauth_secret_keys:
+          - AZURE_TENANT_ID
+          - AZURE_GRAPH_CLIENT_ID
+          - AZURE_GRAPH_CLIENT_SECRET
+          - MS_EMAIL_TENANT_ID
+          - MS_CLIENT_ID
+
+    - name: "OAuth resolve: Read secret key from cluster"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - secret
+          - contentiq-backend-secrets
+          - -n
+          - "{{ contentiq_namespace }}"
+          - -o
+          - "jsonpath={.data.{{ item }}}"
+      register: contentiq_oauth_secret_key_lookup
+      loop: "{{ contentiq_oauth_secret_keys }}"
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: "OAuth resolve: Initialize decoded secret map"
+      ansible.builtin.set_fact:
+        contentiq_oauth_secret_values: {}
+
+    - name: "OAuth resolve: Decode secret values"
+      ansible.builtin.set_fact:
+        contentiq_oauth_secret_values: "{{ contentiq_oauth_secret_values | combine({item.item: _val}) }}"
+      vars:
+        _raw: "{{ item.stdout | default('') | trim }}"
+        _val: "{{ (_raw | b64decode | trim) if (_raw | length > 0) else '' }}"
+      loop: "{{ contentiq_oauth_secret_key_lookup.results }}"
+      no_log: true
+
+- name: "OAuth resolve: Merge vars, env, and secret for Microsoft Graph"
+  ansible.builtin.set_fact:
+    contentiq_oauth_microsoft_tenant_id: >-
+      {{
+        (
+          contentiq_azure_tenant_id
+          | default(lookup('env', 'AZURE_TENANT_ID') | default('', true), true)
+          | default(contentiq_oauth_secret_values['AZURE_TENANT_ID'] | default('', true), true)
+          | default(contentiq_oauth_secret_values['MS_EMAIL_TENANT_ID'] | default('', true), true)
+        ) | trim
+      }}
+    contentiq_oauth_microsoft_graph_client_id: >-
+      {{
+        (
+          contentiq_azure_graph_client_id
+          | default(lookup('env', 'AZURE_GRAPH_CLIENT_ID') | default('', true), true)
+          | default(contentiq_oauth_secret_values['AZURE_GRAPH_CLIENT_ID'] | default('', true), true)
+        ) | trim
+      }}
+    contentiq_oauth_microsoft_graph_client_secret: >-
+      {{
+        (
+          contentiq_azure_graph_client_secret
+          | default(lookup('env', 'AZURE_GRAPH_CLIENT_SECRET') | default('', true), true)
+          | default(contentiq_oauth_secret_values['AZURE_GRAPH_CLIENT_SECRET'] | default('', true), true)
+        ) | trim
+      }}
+    contentiq_oauth_microsoft_target_app_id: >-
+      {{
+        (
+          contentiq_microsoft_client_id
+          | default(lookup('env', 'MS_CLIENT_ID') | default('', true), true)
+          | default(contentiq_oauth_secret_values['MS_CLIENT_ID'] | default('', true), true)
+        ) | trim
+      }}
+  when: contentiq_oauth_sync_mode in ['auto', 'true']
+  no_log: true
+
+- name: "OAuth resolve: Enable Microsoft sync when automation creds exist"
+  ansible.builtin.set_fact:
+    contentiq_oauth_microsoft_sync_enabled: >-
+      {{
+        (contentiq_oauth_microsoft_tenant_id | length > 0)
+        and (contentiq_oauth_microsoft_graph_client_id | length > 0)
+        and (contentiq_oauth_microsoft_graph_client_secret | length > 0)
+        and (contentiq_oauth_microsoft_target_app_id | length > 0)
+      }}
+  when: contentiq_oauth_sync_mode == 'auto'
+
+- name: "OAuth resolve: Require Microsoft sync in strict mode"
+  ansible.builtin.set_fact:
+    contentiq_oauth_microsoft_sync_enabled: true
+  when: contentiq_oauth_sync_mode == 'true'
+
+- name: "OAuth resolve: Fail when strict mode lacks automation creds"
+  ansible.builtin.assert:
+    that:
+      - contentiq_oauth_microsoft_tenant_id | length > 0
+      - contentiq_oauth_microsoft_graph_client_id | length > 0
+      - contentiq_oauth_microsoft_graph_client_secret | length > 0
+      - contentiq_oauth_microsoft_target_app_id | length > 0
+    fail_msg: >-
+      contentiq_sync_oauth_redirect_uris_to_providers is true but Azure Graph automation
+      credentials are missing. Add AZURE_GRAPH_CLIENT_ID, AZURE_GRAPH_CLIENT_SECRET,
+      AZURE_TENANT_ID (or MS_EMAIL_TENANT_ID), and MS_CLIENT_ID to IBM Secrets Manager /
+      contentiq-backend-secrets. The connector app's own secret cannot update redirect URIs.
+  when: contentiq_oauth_sync_mode == 'true'
