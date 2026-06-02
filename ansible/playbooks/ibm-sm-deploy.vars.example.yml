@@ -11,6 +11,11 @@
 #
 contentiq_fetch_secrets_from_ibm_sm: true
 contentiq_manage_pull_secret: false
+
+# Google/Box OAuth: deploy.yml defaults to fixed callback (oauth.contentiq.symplistic.ai).
+# On-prem / IBM SM: store BOX_*, GOOGLE_*, OAUTH_CALLBACK_PROXY_BASE in SM (one-time):
+#   ./playbooks/scripts/add-platform-oauth-keys-to-ibm-sm-backend.sh --sync-cluster
+# contentiq_oauth_fixed_callback_base: "https://oauth.contentiq.symplistic.ai"
 contentiq_secrets_manager_endpoint_url: "https://YOUR_INSTANCE_ID.us-south.secrets-manager.appdomain.cloud"
 contentiq_ibmsm_backend_secret_id: "00000000-0000-0000-0000-000000000000"
 contentiq_ibmsm_rag_secret_id: "00000000-0000-0000-0000-000000000000"
