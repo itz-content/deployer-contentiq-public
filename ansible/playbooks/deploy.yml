@@ -224,6 +224,9 @@
     contentiq_render_dir: "{{ contentiq_root_dir }}/.rendered"
 
     # After Routes exist: align contentiq-backend-secrets to live Route hosts (CUSTOMER-GUIDE oc patch flow).
+    # Backend 1.3.x image bakes staging MONGODB_URI into .env; load_dotenv(override=True) wins over K8s secrets.
+    contentiq_backend_strip_baked_dotenv: true
+    contentiq_backend_dotenv_restart_after_patch: true
     contentiq_align_backend_secret_to_live_routes: true
     contentiq_align_backend_oauth_redirects: true
     contentiq_step6b_wait_backend_rollout_after_align: true
@@ -1024,6 +1027,10 @@
         - contentiq_frontend_apply_runtime_config_patch | bool
         - contentiq_frontend_patch_early_after_cr | bool
 
+    - name: "Step 6a-pre: Strip baked backend .env so K8s MONGODB_URI is used"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/patch-backend-dotenv-override.yml"
+      when: contentiq_backend_strip_baked_dotenv | bool
+
     # --- Step 6b: Align backend secret to live Routes (guide: oc patch FRONTEND_URL, CORS, cookie, OAuth + rollout restart) ---
     - name: "Step 6b: Wait for frontend route hostname"
       ansible.builtin.command:
@@ -1106,6 +1113,12 @@
       no_log: true
 
     # Same as rollout-wait-one.yml: without this, the Deployment keeps the 10m default progress deadline.
+    - name: "Step 6b-pre: Re-assert backend dotenv override before route-alignment restart"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/patch-backend-dotenv-override.yml"
+      vars:
+        contentiq_backend_dotenv_restart_after_patch: false
+      when: contentiq_backend_strip_baked_dotenv | bool
+
     - name: "Step 6b: Ensure backend deployment progress deadline before route-alignment restart/wait"
       ansible.builtin.include_tasks: "{{ playbook_dir | dirname }}/roles/contentiq_install/tasks/patch_deployment_min_progress_deadline.yml"
       vars:
@@ -1131,6 +1144,14 @@
     # Operator reconcile after rollout restart can reset spec.progressDeadlineSeconds to the default (600s);
     # phased rollouts already re-patch after restart in rollout-wait-one.yml — mirror that here so Step 6b
     # does not fail at ~10m while pods are still pulling or scheduling.
+    - name: "Step 6b: Re-assert backend dotenv override after route-alignment restart"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/patch-backend-dotenv-override.yml"
+      vars:
+        contentiq_backend_dotenv_restart_after_patch: false
+      when:
+        - contentiq_align_backend_secret_to_live_routes | bool
+        - contentiq_backend_strip_baked_dotenv | bool
+
     - name: "Step 6b: Re-ensure backend progress deadline after rollout restart"
       ansible.builtin.include_tasks: "{{ playbook_dir | dirname }}/roles/contentiq_install/tasks/patch_deployment_min_progress_deadline.yml"
       vars:
@@ -1141,16 +1162,7 @@
         - contentiq_step6b_wait_backend_rollout_after_align | bool
 
     - name: "Step 6b: Wait for backend rollout after route alignment"
-      ansible.builtin.command:
-        argv:
-          - "{{ contentiq_oc_binary }}"
-          - rollout
-          - status
-          - deployment/contentiq-backend
-          - -n
-          - "{{ contentiq_namespace }}"
-          - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
-      changed_when: false
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/wait-backend-rollout-step6b.yml"
       when:
         - contentiq_align_backend_secret_to_live_routes | bool
         - contentiq_step6b_wait_backend_rollout_after_align | bool

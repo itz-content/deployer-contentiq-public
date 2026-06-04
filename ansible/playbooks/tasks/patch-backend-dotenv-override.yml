@@ -1,0 +1,92 @@
+---
+# Backend image 1.3.x ships /app/contentIQ_backend/.env with MONGODB_URI for staging-dev.
+# app_factory.py calls load_dotenv(..., override=True), which overwrites K8s secret env vars.
+# Mount a blank .env so contentiq-backend-secrets MONGODB_URI is used.
+# Re-apply after operator reconcile (same pattern as frontend runtime patch).
+
+- name: "Backend dotenv: Apply override ConfigMap"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - apply
+      - -f
+      - "{{ playbook_dir }}/../manifests/backend-dotenv-override-configmap.yaml"
+  register: contentiq_backend_dotenv_cm_apply
+  changed_when: >-
+    'created' in (contentiq_backend_dotenv_cm_apply.stdout | default(''))
+    or 'configured' in (contentiq_backend_dotenv_cm_apply.stdout | default(''))
+
+- name: "Backend dotenv: Wait for contentiq-backend deployment"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - deployment
+      - contentiq-backend
+      - -n
+      - "{{ contentiq_namespace }}"
+  register: contentiq_backend_dotenv_dep_wait
+  changed_when: false
+  retries: "{{ contentiq_wait_retries }}"
+  delay: "{{ contentiq_wait_delay_seconds }}"
+  until: contentiq_backend_dotenv_dep_wait.rc == 0
+
+- name: "Backend dotenv: Patch deployment to mount blank .env over image bake-in"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - patch
+      - deployment
+      - contentiq-backend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - --type=strategic
+      - -p
+      - >-
+        {{
+          {
+            'spec': {
+              'template': {
+                'spec': {
+                  'volumes': [
+                    {
+                      'name': 'backend-dotenv-override',
+                      'configMap': {'name': 'backend-dotenv-override'},
+                    }
+                  ],
+                  'containers': [
+                    {
+                      'name': 'backend',
+                      'volumeMounts': [
+                        {
+                          'name': 'backend-dotenv-override',
+                          'mountPath': '/app/contentIQ_backend/.env',
+                          'subPath': '.env',
+                          'readOnly': True,
+                        }
+                      ],
+                    }
+                  ],
+                }
+              }
+            }
+          } | to_json
+        }}
+  register: contentiq_backend_dotenv_dep_patch
+  changed_when: >-
+    'patched' in (contentiq_backend_dotenv_dep_patch.stdout | default(''))
+    or 'configured' in (contentiq_backend_dotenv_dep_patch.stdout | default(''))
+
+- name: "Backend dotenv: Restart backend when dotenv mount patch changed"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - rollout
+      - restart
+      - deployment/contentiq-backend
+      - -n
+      - "{{ contentiq_namespace }}"
+  when:
+    - contentiq_backend_dotenv_restart_after_patch | default(true) | bool
+    - contentiq_backend_dotenv_dep_patch is changed
+  changed_when: true

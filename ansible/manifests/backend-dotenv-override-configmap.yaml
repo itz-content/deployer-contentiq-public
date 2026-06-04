@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-dotenv-override
+  namespace: contentiq
+  labels:
+    app: contentiq-backend
+data:
+  .env: |
+    # K8s secret provides MONGODB_URI; do not override from image bake-in

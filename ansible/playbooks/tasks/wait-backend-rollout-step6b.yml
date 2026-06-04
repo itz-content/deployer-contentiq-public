@@ -1,0 +1,88 @@
+---
+# Step 6b rollout wait: operator reconcile often drops progressDeadlineSeconds (600s) and
+# removes the backend-dotenv-override mount, reviving the image's staging MONGODB_URI.
+# Re-assert patches before wait; recover on progress-deadline failure like rollout-wait-one.yml.
+
+- name: "Step 6b: Re-assert backend dotenv override before rollout wait"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/patch-backend-dotenv-override.yml"
+  vars:
+    contentiq_backend_dotenv_restart_after_patch: false
+  when: contentiq_backend_strip_baked_dotenv | default(true) | bool
+
+- name: "Step 6b: Re-ensure backend progress deadline before rollout wait"
+  ansible.builtin.include_tasks: "{{ playbook_dir | dirname }}/roles/contentiq_install/tasks/patch_deployment_min_progress_deadline.yml"
+  vars:
+    patch_dep_name: contentiq-backend
+    patch_dep_namespace: "{{ contentiq_namespace }}"
+
+- name: "Step 6b: Wait for backend rollout after route alignment (first attempt)"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - rollout
+      - status
+      - deployment/contentiq-backend
+      - -n
+      - "{{ contentiq_namespace }}"
+      - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
+  register: contentiq_step6b_rollout_wait
+  changed_when: false
+  failed_when: false
+
+- name: "Step 6b: Recover backend rollout after progress deadline or operator revert"
+  when:
+    - contentiq_rollout_recover_on_progress_deadline | default(true) | bool
+    - (contentiq_step6b_rollout_wait.rc | default(0)) != 0
+  block:
+    - name: "Step 6b: Re-assert backend dotenv override before recovery restart"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/patch-backend-dotenv-override.yml"
+      vars:
+        contentiq_backend_dotenv_restart_after_patch: false
+      when: contentiq_backend_strip_baked_dotenv | default(true) | bool
+
+    - name: "Step 6b: rollout restart after failed rollout wait"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - rollout
+          - restart
+          - deployment/contentiq-backend
+          - -n
+          - "{{ contentiq_namespace }}"
+      changed_when: true
+
+    - name: "Step 6b: Re-assert backend dotenv override after recovery restart"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/patch-backend-dotenv-override.yml"
+      vars:
+        contentiq_backend_dotenv_restart_after_patch: false
+      when: contentiq_backend_strip_baked_dotenv | default(true) | bool
+
+    - name: "Step 6b: Re-apply backend progress deadline after recovery restart"
+      ansible.builtin.include_tasks: "{{ playbook_dir | dirname }}/roles/contentiq_install/tasks/patch_deployment_min_progress_deadline.yml"
+      vars:
+        patch_dep_name: contentiq-backend
+        patch_dep_namespace: "{{ contentiq_namespace }}"
+
+    - name: "Step 6b: Wait for backend rollout after recovery"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - rollout
+          - status
+          - deployment/contentiq-backend
+          - -n
+          - "{{ contentiq_namespace }}"
+          - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
+      register: contentiq_step6b_rollout_wait
+      changed_when: false
+      failed_when: false
+
+- name: "Step 6b: Fail if backend rollout did not succeed"
+  ansible.builtin.fail:
+    msg: >-
+      Backend rollout failed after route alignment in namespace {{ contentiq_namespace }}.
+      rc={{ contentiq_step6b_rollout_wait.rc | default('n/a') }}
+      stderr={{ contentiq_step6b_rollout_wait.stderr | default('') }}
+      If logs show contentiq-staging-dev.msdgbw.mongodb.net, the operator removed the
+      backend-dotenv-override mount; re-run the play or patch manually.
+  when: (contentiq_step6b_rollout_wait.rc | default(0)) != 0

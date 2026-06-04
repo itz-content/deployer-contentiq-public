@@ -15,6 +15,14 @@
     - contentiq_frontend_patch_before_rollout | default(true) | bool
     - not (contentiq_frontend_early_patch_done | default(false) | bool)
 
+- name: "Step 6: Re-assert backend dotenv override before rollout wait"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/patch-backend-dotenv-override.yml"
+  vars:
+    contentiq_backend_dotenv_restart_after_patch: false
+  when:
+    - rollout_dep_name == 'contentiq-backend'
+    - contentiq_backend_strip_baked_dotenv | default(true) | bool
+
 - name: "Step 6: Ensure progress deadline before deployment rollout wait"
   ansible.builtin.include_tasks: patch_deployment_min_progress_deadline.yml
   vars:
@@ -99,6 +107,13 @@
       vars:
         patch_dep_name: "{{ rollout_dep_name }}"
         patch_dep_namespace: "{{ contentiq_namespace }}"
+    - name: "Step 6: Re-assert backend dotenv override after progress-deadline recovery restart"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/patch-backend-dotenv-override.yml"
+      vars:
+        contentiq_backend_dotenv_restart_after_patch: false
+      when:
+        - rollout_dep_name == 'contentiq-backend'
+        - contentiq_backend_strip_baked_dotenv | default(true) | bool
     - name: "Step 6: Wait for deployment rollout (after recovery)"
       ansible.builtin.command:
         argv:
