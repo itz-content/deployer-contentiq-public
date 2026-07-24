@@ -1,0 +1,238 @@
+---
+# Idempotent Lakekeeper bootstrap for every fresh deploy / re-run.
+# Without this, /management/v1/info can report bootstrapped=false even when the
+# operator created project/warehouse — structured playground chat then soft-fails
+# ("couldn't retrieve the information") while website vector RAG still works.
+#
+# Runs from contentiq-backend (has python3) against http://lakekeeper:8181.
+# Accepts already-bootstrapped / conflict responses. Skips when lakekeeper or
+# backend is missing (phase-2 deferred / early cluster).
+
+- name: "Lakekeeper bootstrap: Detect lakekeeper Deployment"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - deployment
+      - lakekeeper
+      - -n
+      - "{{ contentiq_namespace }}"
+  register: contentiq_lakekeeper_bootstrap_dep
+  changed_when: false
+  failed_when: false
+
+- name: "Lakekeeper bootstrap: Detect backend Deployment"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - deployment
+      - contentiq-backend
+      - -n
+      - "{{ contentiq_namespace }}"
+  register: contentiq_lakekeeper_bootstrap_backend_dep
+  changed_when: false
+  failed_when: false
+  when: contentiq_lakekeeper_bootstrap_dep.rc | default(1) == 0
+
+- name: "Lakekeeper bootstrap: Skip when lakekeeper is not deployed"
+  ansible.builtin.debug:
+    msg: >-
+      Skipped Lakekeeper bootstrap: deployment/lakekeeper not found in
+      {{ contentiq_namespace }} (structured data deferred or not deployed).
+  when: contentiq_lakekeeper_bootstrap_dep.rc | default(1) != 0
+
+- name: "Lakekeeper bootstrap: Wait for lakekeeper Deployment Available"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - rollout
+      - status
+      - deployment/lakekeeper
+      - -n
+      - "{{ contentiq_namespace }}"
+      - "--timeout={{ contentiq_lakekeeper_bootstrap_rollout_timeout | default('300s') }}"
+  register: contentiq_lakekeeper_bootstrap_rollout
+  changed_when: false
+  when:
+    - contentiq_lakekeeper_bootstrap_dep.rc | default(1) == 0
+    - contentiq_lakekeeper_bootstrap_backend_dep.rc | default(1) == 0
+
+- name: "Lakekeeper bootstrap: Read SERVICE_TOKEN (prefer lakekeeper-auth-tokens)"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - secret
+      - lakekeeper-auth-tokens
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.data.SERVICE_TOKEN}
+  register: contentiq_lakekeeper_bootstrap_token_b64
+  changed_when: false
+  failed_when: false
+  when:
+    - contentiq_lakekeeper_bootstrap_dep.rc | default(1) == 0
+    - contentiq_lakekeeper_bootstrap_backend_dep.rc | default(1) == 0
+
+- name: "Lakekeeper bootstrap: Fall back to LAKEHOUSE_SERVICE_TOKEN from backend secret"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - get
+      - secret
+      - contentiq-backend-secrets
+      - -n
+      - "{{ contentiq_namespace }}"
+      - -o
+      - jsonpath={.data.LAKEHOUSE_SERVICE_TOKEN}
+  register: contentiq_lakekeeper_bootstrap_backend_token_b64
+  changed_when: false
+  failed_when: false
+  when:
+    - contentiq_lakekeeper_bootstrap_dep.rc | default(1) == 0
+    - contentiq_lakekeeper_bootstrap_backend_dep.rc | default(1) == 0
+    - (contentiq_lakekeeper_bootstrap_token_b64.stdout | default('') | trim | length) == 0
+
+- name: "Lakekeeper bootstrap: Decode auth token"
+  ansible.builtin.set_fact:
+    contentiq_lakekeeper_bootstrap_token_b64_effective: >-
+      {{
+        (
+          contentiq_lakekeeper_bootstrap_token_b64.stdout
+          if (contentiq_lakekeeper_bootstrap_token_b64.stdout | default('') | trim | length) > 0
+          else (contentiq_lakekeeper_bootstrap_backend_token_b64.stdout | default(''))
+        )
+        | trim
+      }}
+  when:
+    - contentiq_lakekeeper_bootstrap_dep.rc | default(1) == 0
+    - contentiq_lakekeeper_bootstrap_backend_dep.rc | default(1) == 0
+
+- name: "Lakekeeper bootstrap: Set decoded auth token"
+  ansible.builtin.set_fact:
+    contentiq_lakekeeper_bootstrap_token: >-
+      {{
+        (contentiq_lakekeeper_bootstrap_token_b64_effective | b64decode)
+        if (contentiq_lakekeeper_bootstrap_token_b64_effective | default('') | length) > 0
+        else ''
+      }}
+  when:
+    - contentiq_lakekeeper_bootstrap_dep.rc | default(1) == 0
+    - contentiq_lakekeeper_bootstrap_backend_dep.rc | default(1) == 0
+
+- name: "Lakekeeper bootstrap: Ensure accept-terms-of-use (idempotent POST)"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - exec
+      - -n
+      - "{{ contentiq_namespace }}"
+      - deploy/contentiq-backend
+      - -c
+      - "{{ contentiq_backend_container_name | default('backend') }}"
+      - --
+      - python3
+      - -c
+      - |
+        import json
+        import os
+        import urllib.error
+        import urllib.request
+
+        token = os.environ.get("LK_TOKEN", "").strip()
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        info_req = urllib.request.Request(
+            "http://lakekeeper:8181/management/v1/info",
+            headers=headers,
+            method="GET",
+        )
+        with urllib.request.urlopen(info_req, timeout=20) as resp:
+            info = json.loads(resp.read().decode())
+        if info.get("bootstrapped") is True:
+            print("ALREADY_BOOTSTRAPPED")
+            raise SystemExit(0)
+
+        body = json.dumps({"accept-terms-of-use": True}).encode()
+        boot_req = urllib.request.Request(
+            "http://lakekeeper:8181/management/v1/bootstrap",
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(boot_req, timeout=30) as resp:
+                code = resp.getcode()
+                _ = resp.read()
+            print(f"BOOTSTRAPPED:{code}")
+        except urllib.error.HTTPError as exc:
+            # Concurrent bootstrap / already accepted terms
+            if exc.code in (204, 409, 422):
+                print(f"BOOTSTRAP_OK_CONFLICT:{exc.code}")
+                raise SystemExit(0)
+            detail = exc.read().decode(errors="replace")[:500]
+            print(f"BOOTSTRAP_HTTP_ERROR:{exc.code}:{detail}")
+            raise SystemExit(1)
+  environment:
+    LK_TOKEN: "{{ contentiq_lakekeeper_bootstrap_token | default('') }}"
+  register: contentiq_lakekeeper_bootstrap_post
+  changed_when: >-
+    'BOOTSTRAPPED:' in (contentiq_lakekeeper_bootstrap_post.stdout | default(''))
+  when:
+    - contentiq_lakekeeper_bootstrap_dep.rc | default(1) == 0
+    - contentiq_lakekeeper_bootstrap_backend_dep.rc | default(1) == 0
+    - contentiq_lakekeeper_bootstrap_rollout is succeeded
+
+- name: "Lakekeeper bootstrap: Confirm bootstrapped=true"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - exec
+      - -n
+      - "{{ contentiq_namespace }}"
+      - deploy/contentiq-backend
+      - -c
+      - "{{ contentiq_backend_container_name | default('backend') }}"
+      - --
+      - python3
+      - -c
+      - |
+        import json
+        import os
+        import urllib.request
+
+        token = os.environ.get("LK_TOKEN", "").strip()
+        headers = {"Accept": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(
+            "http://lakekeeper:8181/management/v1/info",
+            headers=headers,
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            info = json.loads(resp.read().decode())
+        print(json.dumps({"bootstrapped": bool(info.get("bootstrapped")), "version": info.get("version")}))
+        raise SystemExit(0 if info.get("bootstrapped") is True else 1)
+  environment:
+    LK_TOKEN: "{{ contentiq_lakekeeper_bootstrap_token | default('') }}"
+  register: contentiq_lakekeeper_bootstrap_confirm
+  changed_when: false
+  when:
+    - contentiq_lakekeeper_bootstrap_dep.rc | default(1) == 0
+    - contentiq_lakekeeper_bootstrap_backend_dep.rc | default(1) == 0
+    - contentiq_lakekeeper_bootstrap_rollout is succeeded
+
+- name: "Lakekeeper bootstrap: Report status"
+  ansible.builtin.debug:
+    msg: >-
+      Lakekeeper bootstrap:
+      {{ contentiq_lakekeeper_bootstrap_post.stdout | default('') | trim }}
+      confirm={{ contentiq_lakekeeper_bootstrap_confirm.stdout | default('') | trim }}
+  when:
+    - contentiq_lakekeeper_bootstrap_dep.rc | default(1) == 0
+    - contentiq_lakekeeper_bootstrap_confirm is defined

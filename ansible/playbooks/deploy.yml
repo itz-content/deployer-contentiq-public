@@ -290,6 +290,11 @@
     contentiq_align_lakehouse_restart_backend: true
     contentiq_align_lakehouse_wait_rollout: true
 
+    # Step 6-post: POST /management/v1/bootstrap when lakekeeper reports bootstrapped=false.
+    # Operator may create project/warehouse without accepting terms; structured chat then soft-fails.
+    contentiq_bootstrap_lakekeeper: true
+    contentiq_lakekeeper_bootstrap_rollout_timeout: 300s
+
     # Step 6-post: /env.json + CORS after rollouts.
     contentiq_verify_deploy_connectivity: true
     contentiq_verify_env_json_and_cors: true
@@ -864,6 +869,7 @@
         contentiq_derived_backend_url: "https://{{ contentiq_route_backend_host }}"
         contentiq_derived_session_cookie_domain: "{{ contentiq_route_frontend_host | regex_replace('^[^.]+', '') }}"
         contentiq_derived_microsoft_redirect: "{{ ('https://' ~ contentiq_route_backend_host) ~ '/api/connections/microsoft/auth/microsoft/callback' }}"
+        contentiq_derived_tool_api_endpoint: "{{ ('https://' ~ contentiq_route_backend_host) ~ '/api/external/contentiq-tool-query' }}"
       when: contentiq_auto_route_hostnames | bool
 
     - name: Resolve Google and Box OAuth redirect URIs for rendered backend secret
@@ -912,6 +918,7 @@
         - { regexp: '__CONTENTIQ_BOX_REDIRECT_URI__', replace: "{{ contentiq_derived_box_redirect }}" }
         - { regexp: '__CONTENTIQ_GOOGLE_REDIRECT_URI__', replace: "{{ contentiq_derived_google_redirect }}" }
         - { regexp: '__CONTENTIQ_OAUTH_CALLBACK_PROXY_BASE__', replace: "{{ contentiq_derived_oauth_callback_proxy_base | default('') }}" }
+        - { regexp: '__CONTENTIQ_TOOL_API_ENDPOINT__', replace: "{{ contentiq_derived_tool_api_endpoint }}" }
       when:
         - contentiq_auto_route_hostnames | bool
         - not (contentiq_fetch_secrets_from_ibm_sm | default(false) | bool)
@@ -1074,7 +1081,11 @@
           FRONTEND_URL: "https://{{ contentiq_step6b_fe }}"
           CORS_ALLOWED_ORIGINS: "https://{{ contentiq_step6b_fe }}"
           SESSION_COOKIE_DOMAIN: "{{ contentiq_step6b_fe | regex_replace('^[^.]+', '') }}"
+          # Cross-origin FE/BE routes: required for Safari/iOS credentialed fetches.
+          SESSION_COOKIE_SAMESITE: "None"
+          SESSION_COOKIE_SECURE: "true"
           MICROSOFT_REDIRECT_URI: "https://{{ contentiq_step6b_be }}/api/connections/microsoft/auth/microsoft/callback"
+          THREAD_MESSAGE_TIMESTAMPS_FILE: "/tmp/.thread_message_timestamps.json"
       vars:
         contentiq_step6b_fe: "{{ contentiq_step6b_frontend_route.stdout | trim }}"
         contentiq_step6b_be: "{{ contentiq_step6b_backend_route.stdout | trim }}"

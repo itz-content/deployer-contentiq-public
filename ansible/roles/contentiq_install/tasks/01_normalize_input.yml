@@ -201,7 +201,9 @@
               {
                 'FRONTEND_URL': contentiq_install_frontend_url,
                 'CORS_ALLOWED_ORIGINS': contentiq_install_frontend_url,
-                'SESSION_COOKIE_DOMAIN': contentiq_install_session_cookie_domain
+                'SESSION_COOKIE_DOMAIN': contentiq_install_session_cookie_domain,
+                'SESSION_COOKIE_SAMESITE': 'None',
+                'SESSION_COOKIE_SECURE': 'true'
               }
               if (
                 contentiq_auto_compute_route_settings | bool
@@ -214,7 +216,8 @@
         | combine(
             (
               {
-                'MICROSOFT_REDIRECT_URI': contentiq_install_backend_url ~ '/api/connections/microsoft/auth/microsoft/callback'
+                'MICROSOFT_REDIRECT_URI': contentiq_install_backend_url ~ '/api/connections/microsoft/auth/microsoft/callback',
+                'CONTENTIQ_TOOL_API_ENDPOINT': contentiq_install_backend_url ~ '/api/external/contentiq-tool-query'
               }
               if (
                 contentiq_auto_compute_route_settings | bool

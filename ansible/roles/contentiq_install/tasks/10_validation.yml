@@ -77,7 +77,11 @@
       FRONTEND_URL: "https://{{ contentiq_install_frontend_route_host }}"
       CORS_ALLOWED_ORIGINS: "https://{{ contentiq_install_frontend_route_host }}"
       SESSION_COOKIE_DOMAIN: "{{ contentiq_install_frontend_route_host | regex_replace('^[^.]+', '') }}"
+      SESSION_COOKIE_SAMESITE: "None"
+      SESSION_COOKIE_SECURE: "true"
       MICROSOFT_REDIRECT_URI: "https://{{ contentiq_install_backend_route_host }}/api/connections/microsoft/auth/microsoft/callback"
+      THREAD_MESSAGE_TIMESTAMPS_FILE: "/tmp/.thread_message_timestamps.json"
+      CONTENTIQ_TOOL_API_ENDPOINT: "https://{{ contentiq_install_backend_route_host }}/api/external/contentiq-tool-query"
       GOOGLE_REDIRECT_URI: >-
         {{
           'https://' ~ contentiq_install_backend_route_host ~ '/api/connections/googledrive/auth/google/callback'

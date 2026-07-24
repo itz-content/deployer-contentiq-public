@@ -79,6 +79,36 @@
     - contentiq_verify_deploy_connectivity | bool
     - contentiq_verify_env_json_and_cors | default(true) | bool
 
+- name: "Verify: Safari session cookie attrs on backend secret"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    samesite="$({{ contentiq_oc_binary }} get secret contentiq-backend-secrets -n {{ contentiq_namespace }} -o jsonpath='{.data.SESSION_COOKIE_SAMESITE}' | base64 -d || true)"
+    secure="$({{ contentiq_oc_binary }} get secret contentiq-backend-secrets -n {{ contentiq_namespace }} -o jsonpath='{.data.SESSION_COOKIE_SECURE}' | base64 -d || true)"
+    echo "SESSION_COOKIE_SAMESITE=${samesite}"
+    echo "SESSION_COOKIE_SECURE=${secure}"
+    test "${samesite}" = "None"
+    test "${secure}" = "true"
+  args:
+    executable: /bin/bash
+  register: contentiq_step6e_session_cookie_attrs
+  changed_when: false
+  failed_when: false
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - contentiq_verify_env_json_and_cors | default(true) | bool
+
+- name: "Verify: Assert Safari session cookie attrs"
+  ansible.builtin.assert:
+    that:
+      - contentiq_step6e_session_cookie_attrs.rc == 0
+    fail_msg: >-
+      contentiq-backend-secrets must set SESSION_COOKIE_SAMESITE=None and SESSION_COOKIE_SECURE=true
+      for Safari/iOS (cross-origin FE/BE). Re-run Step 6-post / patch-backend-secret-to-live-routes,
+      or ensure IBM SM backend payload includes those keys. Got: {{ contentiq_step6e_session_cookie_attrs.stdout | default('') }}
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - contentiq_verify_env_json_and_cors | default(true) | bool
+
 - name: "Verify: Read frontend-config keys"
   ansible.builtin.command:
     argv:
@@ -184,6 +214,7 @@
       - "Backend:  {{ contentiq_verify_backend_api_url }}"
       - "/env.json apiBaseUrl: OK"
       - "Backend CORS on /api/support/health: OK"
+      - "SESSION_COOKIE_SAMESITE=None + SESSION_COOKIE_SECURE=true: OK (Safari)"
   when:
     - contentiq_verify_deploy_connectivity | bool
     - contentiq_verify_env_json_and_cors | default(true) | bool

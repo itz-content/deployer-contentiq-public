@@ -13,6 +13,12 @@
     contentiq_align_lakehouse_wait_rollout: false
   when: contentiq_align_lakehouse_ingress_port | bool
 
+- name: "Finalize: Bootstrap Lakekeeper (accept-terms-of-use; idempotent)"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/bootstrap-lakekeeper.yml"
+  when:
+    - contentiq_bootstrap_lakekeeper | default(true) | bool
+    - not (contentiq_defer_phase2_and_structured_poststeps | default(false) | bool)
+
 - name: "Finalize: Align backend secret to live Routes (restart + wait)"
   ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/patch-backend-secret-to-live-routes.yml"
   vars:
