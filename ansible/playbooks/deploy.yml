@@ -284,6 +284,11 @@
       - contentiq-backend
     contentiq_assert_route_timeouts: true
 
+    # Step 6-post: path Route https://<frontend>/api/* → contentiq-backend.
+    # Covers Safari/iOS when layout.html calls /api with empty API_BASE_URL (404 File not found).
+    contentiq_ensure_frontend_api_path_route: true
+    contentiq_frontend_api_path_route_name: contentiq-frontend-api
+
     # Step 6g: LAKEHOUSE_INGRESS_PORT from edge-gateway Service (playground structured path uses :8080).
     contentiq_align_lakehouse_ingress_port: true
     contentiq_lakehouse_ingress_service_name: edge-gateway
@@ -777,6 +782,41 @@
       until: contentiq_step4_operator_dep_wait.rc == 0
       when: contentiq_step4_wait_operator_rollout | bool
 
+    # Published CSV may omit imagePullSecrets; private docker.io pulls then fail until SA is linked
+    # and the pod is restarted. Patch the Deployment so new pods use dockerhub-pull immediately.
+    - name: "Step 4: Ensure operator Deployment imagePullSecrets for private registry"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - patch
+          - deployment
+          - "{{ contentiq_operator_deployment_name }}"
+          - -n
+          - openshift-operators
+          - --type
+          - merge
+          - -p
+          - >-
+            {{
+              {
+                'spec': {
+                  'template': {
+                    'spec': {
+                      'imagePullSecrets': [
+                        {'name': contentiq_pull_secret_name}
+                      ]
+                    }
+                  }
+                }
+              } | to_json
+            }}
+      register: contentiq_step4_operator_ips_patch
+      changed_when: >-
+        'patched' in (contentiq_step4_operator_ips_patch.stdout | default(''))
+      when:
+        - contentiq_step4_wait_operator_rollout | bool
+        - contentiq_registry_pull_secret_link_enabled | bool
+
     - name: "Step 4: Ensure operator deployment progress deadline before rollout wait"
       ansible.builtin.include_tasks: "{{ playbook_dir | dirname }}/roles/contentiq_install/tasks/patch_deployment_min_progress_deadline.yml"
       vars:
@@ -794,8 +834,110 @@
           - -n
           - openshift-operators
           - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
+      register: contentiq_step4_operator_rollout
       changed_when: false
+      failed_when: false
       when: contentiq_step4_wait_operator_rollout | bool
+
+    # ImagePullBackOff before SA link often burns the default 600s deadline; re-link, restart, wait again.
+    - name: "Step 4: Recover operator rollout after progress deadline / ImagePullBackOff"
+      when:
+        - contentiq_step4_wait_operator_rollout | bool
+        - (contentiq_step4_operator_rollout.rc | default(0)) != 0
+      block:
+        - name: "Step 4: Re-link pull secret to operator SA before recovery restart"
+          ansible.builtin.command:
+            argv:
+              - "{{ contentiq_oc_binary }}"
+              - secrets
+              - link
+              - contentiq-operator-controller-manager
+              - "{{ contentiq_pull_secret_name }}"
+              - --for=pull
+              - -n
+              - openshift-operators
+          changed_when: false
+          when: contentiq_registry_pull_secret_link_enabled | bool
+
+        - name: "Step 4: Re-apply operator Deployment imagePullSecrets before recovery restart"
+          ansible.builtin.command:
+            argv:
+              - "{{ contentiq_oc_binary }}"
+              - patch
+              - deployment
+              - "{{ contentiq_operator_deployment_name }}"
+              - -n
+              - openshift-operators
+              - --type
+              - merge
+              - -p
+              - >-
+                {{
+                  {
+                    'spec': {
+                      'template': {
+                        'spec': {
+                          'imagePullSecrets': [
+                            {'name': contentiq_pull_secret_name}
+                          ]
+                        }
+                      }
+                    }
+                  } | to_json
+                }}
+          changed_when: false
+          when: contentiq_registry_pull_secret_link_enabled | bool
+
+        - name: "Step 4: rollout restart operator after progress deadline"
+          ansible.builtin.command:
+            argv:
+              - "{{ contentiq_oc_binary }}"
+              - rollout
+              - restart
+              - "deployment/{{ contentiq_operator_deployment_name }}"
+              - -n
+              - openshift-operators
+          changed_when: true
+
+        - name: "Step 4: Re-apply min progress deadline after operator recovery restart"
+          ansible.builtin.include_tasks: "{{ playbook_dir | dirname }}/roles/contentiq_install/tasks/patch_deployment_min_progress_deadline.yml"
+          vars:
+            patch_dep_name: "{{ contentiq_operator_deployment_name }}"
+            patch_dep_namespace: openshift-operators
+
+        - name: "Step 4: Wait for operator controller-manager deployment rollout (after recovery)"
+          ansible.builtin.command:
+            argv:
+              - "{{ contentiq_oc_binary }}"
+              - rollout
+              - status
+              - "deployment/{{ contentiq_operator_deployment_name }}"
+              - -n
+              - openshift-operators
+              - "--timeout={{ contentiq_rollout_timeout_seconds }}s"
+          register: contentiq_step4_operator_rollout_recovery
+          changed_when: false
+
+    - name: "Step 4: Fail if operator rollout did not succeed"
+      ansible.builtin.fail:
+        msg: >-
+          Operator deployment {{ contentiq_operator_deployment_name }} rollout failed:
+          {{ contentiq_step4_operator_rollout_recovery.stderr | default(contentiq_step4_operator_rollout.stderr | default('unknown')) }}
+      when:
+        - contentiq_step4_wait_operator_rollout | bool
+        - >-
+          (
+            (contentiq_step4_operator_rollout_recovery is defined)
+            and (not (contentiq_step4_operator_rollout_recovery.skipped | default(false)))
+            and ((contentiq_step4_operator_rollout_recovery.rc | default(1)) != 0)
+          )
+          or (
+            (
+              contentiq_step4_operator_rollout_recovery is not defined
+              or (contentiq_step4_operator_rollout_recovery.skipped | default(false))
+            )
+            and ((contentiq_step4_operator_rollout.rc | default(0)) != 0)
+          )
 
     - name: "Step 4: Wait for installed CSV to Succeeded"
       ansible.builtin.command:

@@ -1,0 +1,24 @@
+---
+# Safari (and any client with empty API_BASE_URL) calls same-origin /api/* on the frontend host.
+# Without this Route those hit frontend SimpleHTTP → 404 "File not found" and the sidebar stays "User".
+# Path Route: https://<frontend-host>/api/* → contentiq-backend. Chrome absolute apiBaseUrl is unchanged.
+# Implementation: ansible/scripts/ensure-frontend-api-path-route.sh (idempotent oc apply + probe).
+
+- name: "Frontend API path: Ensure Route via script"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_root_dir }}/scripts/ensure-frontend-api-path-route.sh"
+  environment:
+    NS: "{{ contentiq_namespace }}"
+    OC: "{{ contentiq_oc_binary }}"
+    ROUTE_NAME: "{{ contentiq_frontend_api_path_route_name | default('contentiq-frontend-api') }}"
+  register: contentiq_frontend_api_path_script
+  changed_when: >-
+    'created' in (contentiq_frontend_api_path_script.stdout | default(''))
+    or 'configured' in (contentiq_frontend_api_path_script.stdout | default(''))
+  when: contentiq_ensure_frontend_api_path_route | default(true) | bool
+
+- name: "Frontend API path: Show script output"
+  ansible.builtin.debug:
+    msg: "{{ contentiq_frontend_api_path_script.stdout_lines | default([]) }}"
+  when: contentiq_ensure_frontend_api_path_route | default(true) | bool
