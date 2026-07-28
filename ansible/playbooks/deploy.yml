@@ -239,6 +239,8 @@
     contentiq_oauth_fixed_callback_base: "https://oauth.contentiq.symplistic.ai"
     contentiq_oauth_fixed_google_redirect_uri: ""
     contentiq_oauth_fixed_box_redirect_uri: ""
+    # Optional POC: use the same fixed proxy for Microsoft instead of per-reservation registration.
+    # contentiq_oauth_fixed_microsoft_redirect_uri: "https://oauth.contentiq.symplistic.ai/api/connections/microsoft/auth/microsoft/callback"
     # Local/lab only: overlay Box/Google creds from ansible/secrets/backend-secrets-template.yaml after Step 1b.
     # On-prem / TechZone (IBM SM): false — credentials and redirect URIs live in IBM SM; use
     # playbooks/scripts/add-platform-oauth-keys-to-ibm-sm-backend.sh once. Step 6b still patches
@@ -276,7 +278,8 @@
     contentiq_step6c_env_json_verify_delay_seconds: 10
     contentiq_step6c_verify_env_json_in_pod: "{{ not (contentiq_frontend_apply_runtime_config_patch | bool) }}"
 
-    # Step 6d: HAProxy route timeouts (ingest, playground SSE).
+    # Step 6d: HAProxy route timeouts (IBM COS list-folder, ingest, playground SSE).
+    # Default OpenShift router timeout is ~30s; without this, slow COS listing returns 504.
     contentiq_annotate_route_timeouts: true
     contentiq_route_haproxy_timeout: 1800s
     contentiq_route_timeout_targets:
@@ -1024,6 +1027,7 @@
       ansible.builtin.set_fact:
         contentiq_derived_google_redirect: "{{ contentiq_oauth_redirect_uris.google }}"
         contentiq_derived_box_redirect: "{{ contentiq_oauth_redirect_uris.box }}"
+        contentiq_derived_microsoft_redirect: "{{ contentiq_oauth_redirect_uris.microsoft }}"
         contentiq_derived_oauth_callback_proxy_base: "{{ contentiq_oauth_google_box_secret_patch.OAUTH_CALLBACK_PROXY_BASE | default('') }}"
       when: contentiq_auto_route_hostnames | bool
 

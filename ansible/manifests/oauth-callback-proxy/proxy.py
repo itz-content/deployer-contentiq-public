@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
-"""Forward Google/Box OAuth callbacks from a fixed platform hostname to reservation backends.
+"""Forward OAuth callbacks from a fixed platform hostname to reservation backends.
 
-The ContentIQ backend must encode the reservation backend origin in OAuth ``state``, e.g.:
-  base64url(JSON({"backend_origin": "https://api-contentiq-....techzone.ibm.com"}))
+The ContentIQ backend signs an envelope in OAuth ``state``:
+  base64url(compact-json).base64url(hmac-sha256)
 
-Register only this proxy's public URLs in Google Cloud Console and Box Developer Console.
+The HMAC secret must be shared with the backend. The target origin must also
+match OAUTH_CALLBACK_ALLOWED_BACKEND_ORIGINS or one of the suffixes in
+OAUTH_CALLBACK_ALLOWED_BACKEND_SUFFIXES.
 """
 from __future__ import annotations
 
 import base64
+import binascii
+import hashlib
+import hmac
 import json
 import os
 import sys
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -19,45 +25,75 @@ CALLBACK_PATHS = frozenset(
     {
         "/api/connections/googledrive/auth/google/callback",
         "/api/connections/box/auth/box/callback",
+        "/api/connections/microsoft/auth/microsoft/callback",
     }
 )
 
 
-def _decode_json_blob(raw: str) -> dict | None:
-    for payload in (raw, raw + "===", raw + "=="):
-        for decoder in (base64.urlsafe_b64decode, base64.b64decode):
-            try:
-                data = json.loads(decoder(payload.encode("ascii")))
-            except Exception:
-                continue
-            if isinstance(data, dict):
-                return data
-    try:
-        data = json.loads(raw)
-    except Exception:
+def _b64_decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _normalize_origin(value: str) -> str | None:
+    parsed = urllib.parse.urlparse(str(value or "").strip())
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         return None
-    return data if isinstance(data, dict) else None
+    if (
+        parsed.username
+        or parsed.password
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}".rstrip("/")
+
+
+def _allowed_backend(origin: str) -> bool:
+    exact = {
+        item.strip().rstrip("/").lower()
+        for item in os.getenv("OAUTH_CALLBACK_ALLOWED_BACKEND_ORIGINS", "").split(",")
+        if item.strip()
+    }
+    if origin.lower() in exact:
+        return True
+
+    hostname = urllib.parse.urlparse(origin).hostname or ""
+    suffixes = {
+        item.strip().lower().lstrip(".")
+        for item in os.getenv("OAUTH_CALLBACK_ALLOWED_BACKEND_SUFFIXES", "").split(",")
+        if item.strip()
+    }
+    return any(
+        hostname == suffix or hostname.endswith(f".{suffix}")
+        for suffix in suffixes
+    )
 
 
 def backend_from_state(state: str) -> str | None:
-    if not state:
+    if not state or not os.getenv("OAUTH_CALLBACK_STATE_SECRET"):
         return None
-
-    data = _decode_json_blob(state)
-    if data:
-        for key in ("backend_origin", "backend", "return_backend", "return_to"):
-            val = data.get(key)
-            if val:
-                origin = str(val).strip().rstrip("/")
-                if origin.startswith("http://") or origin.startswith("https://"):
-                    return origin
-
-    if ":" in state:
-        tail = state.rsplit(":", 1)[-1].strip().rstrip("/")
-        if tail.startswith("http://") or tail.startswith("https://"):
-            return tail
-
-    return None
+    try:
+        encoded_body, encoded_signature = state.split(".", 1)
+        expected = hmac.new(
+            os.environ["OAUTH_CALLBACK_STATE_SECRET"].encode("utf-8"),
+            encoded_body.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        supplied = _b64_decode(encoded_signature)
+        if not hmac.compare_digest(expected, supplied):
+            return None
+        data = json.loads(_b64_decode(encoded_body).decode("utf-8"))
+        if not isinstance(data, dict) or data.get("v") != 1:
+            return None
+        if int(data.get("exp", 0)) < int(time.time()):
+            return None
+        origin = _normalize_origin(data.get("backend_origin", ""))
+        if not origin or not _allowed_backend(origin):
+            return None
+        return origin
+    except (binascii.Error, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+        return None
 
 
 class OAuthCallbackProxyHandler(BaseHTTPRequestHandler):
