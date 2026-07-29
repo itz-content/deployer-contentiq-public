@@ -1,4 +1,4 @@
-# Platform one-time deploy — forwards Google/Box OAuth callbacks to TechZone reservation backends.
+# Platform one-time deploy — forwards OAuth callbacks to TechZone reservation backends.
 # Apply: ./scripts/deploy-oauth-callback-proxy.sh
 apiVersion: apps/v1
 kind: Deployment
@@ -25,6 +25,22 @@ spec:
           ports:
             - containerPort: 8080
               name: http
+          env:
+            - name: OAUTH_CALLBACK_STATE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: contentiq-oauth-callback-proxy-secret
+                  key: OAUTH_CALLBACK_STATE_SECRET
+            - name: OAUTH_CALLBACK_ALLOWED_BACKEND_ORIGINS
+              valueFrom:
+                secretKeyRef:
+                  name: contentiq-oauth-callback-proxy-secret
+                  key: OAUTH_CALLBACK_ALLOWED_BACKEND_ORIGINS
+            - name: OAUTH_CALLBACK_ALLOWED_BACKEND_SUFFIXES
+              valueFrom:
+                secretKeyRef:
+                  name: contentiq-oauth-callback-proxy-secret
+                  key: OAUTH_CALLBACK_ALLOWED_BACKEND_SUFFIXES
           volumeMounts:
             - name: proxy-script
               mountPath: /app

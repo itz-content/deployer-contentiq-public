@@ -109,6 +109,38 @@
     - contentiq_verify_deploy_connectivity | bool
     - contentiq_verify_env_json_and_cors | default(true) | bool
 
+- name: "Verify: Frontend-host /api path Route proxies to backend (Safari)"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    code="$(curl -sk -o /tmp/contentiq-verify-fe-api.body -w '%{http_code}' \
+      "{{ contentiq_verify_frontend_origin }}/api/auth/get-credentials")"
+    echo "HTTP_${code}"
+    test "${code}" = "401"
+    ! grep -qi 'File not found' /tmp/contentiq-verify-fe-api.body
+  args:
+    executable: /bin/bash
+  register: contentiq_step6e_frontend_api_path
+  changed_when: false
+  failed_when: false
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - contentiq_verify_env_json_and_cors | default(true) | bool
+    - contentiq_ensure_frontend_api_path_route | default(true) | bool
+
+- name: "Verify: Assert frontend-host /api path Route"
+  ansible.builtin.assert:
+    that:
+      - contentiq_step6e_frontend_api_path.rc == 0
+    fail_msg: >-
+      https://{{ contentiq_verify_frontend_host | default('') }}/api/auth/get-credentials must return 401 JSON
+      (proxied to backend), not 404 File not found from frontend static server.
+      Re-run Step 6-post / scripts/ensure-frontend-api-path-route.sh.
+      Got: {{ contentiq_step6e_frontend_api_path.stdout | default('') }}
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - contentiq_verify_env_json_and_cors | default(true) | bool
+    - contentiq_ensure_frontend_api_path_route | default(true) | bool
+
 - name: "Verify: Read frontend-config keys"
   ansible.builtin.command:
     argv:
@@ -215,6 +247,7 @@
       - "/env.json apiBaseUrl: OK"
       - "Backend CORS on /api/support/health: OK"
       - "SESSION_COOKIE_SAMESITE=None + SESSION_COOKIE_SECURE=true: OK (Safari)"
+      - "Frontend-host /api path Route → backend: OK (Safari same-origin /api)"
   when:
     - contentiq_verify_deploy_connectivity | bool
     - contentiq_verify_env_json_and_cors | default(true) | bool
@@ -226,3 +259,64 @@
   when:
     - contentiq_verify_deploy_connectivity | bool
     - contentiq_verify_edge_gateway_from_backend | bool
+
+- name: "Verify: Confirm Lakekeeper bootstrapped=true (when lakekeeper present)"
+  ansible.builtin.command:
+    argv:
+      - "{{ contentiq_oc_binary }}"
+      - exec
+      - -n
+      - "{{ contentiq_namespace }}"
+      - deploy/contentiq-backend
+      - -c
+      - "{{ contentiq_backend_container_name }}"
+      - --
+      - python3
+      - -c
+      - |
+        import json
+        import os
+        import urllib.request
+        token = os.environ.get("LAKEHOUSE_SERVICE_TOKEN", "").strip()
+        headers = {"Accept": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(
+            "http://lakekeeper:8181/management/v1/info",
+            headers=headers,
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            info = json.loads(resp.read().decode())
+        print(json.dumps({"bootstrapped": bool(info.get("bootstrapped"))}))
+        raise SystemExit(0 if info.get("bootstrapped") is True else 1)
+  register: contentiq_verify_lakekeeper_bootstrap_probe
+  changed_when: false
+  failed_when: false
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - contentiq_verify_lakekeeper_bootstrap | default(true) | bool
+    - not (contentiq_defer_phase2_and_structured_poststeps | default(false) | bool)
+
+- name: "Verify: Lakekeeper not bootstrapped (structured playground may soft-fail)"
+  ansible.builtin.debug:
+    msg: >-
+      WARN: Lakekeeper reports bootstrapped=false (or probe failed).
+      Structured document chat may return "couldn't retrieve the information" until
+      Step 6-post bootstrap-lakekeeper.yml runs successfully.
+      stdout={{ contentiq_verify_lakekeeper_bootstrap_probe.stdout | default('') }}
+      stderr={{ contentiq_verify_lakekeeper_bootstrap_probe.stderr | default('') }}
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - contentiq_verify_lakekeeper_bootstrap | default(true) | bool
+    - not (contentiq_defer_phase2_and_structured_poststeps | default(false) | bool)
+    - contentiq_verify_lakekeeper_bootstrap_probe.rc | default(0) != 0
+
+- name: "Verify: Lakekeeper bootstrapped OK"
+  ansible.builtin.debug:
+    msg: "Lakekeeper bootstrapped: OK {{ contentiq_verify_lakekeeper_bootstrap_probe.stdout | default('') | trim }}"
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - contentiq_verify_lakekeeper_bootstrap | default(true) | bool
+    - not (contentiq_defer_phase2_and_structured_poststeps | default(false) | bool)
+    - contentiq_verify_lakekeeper_bootstrap_probe.rc | default(1) == 0
