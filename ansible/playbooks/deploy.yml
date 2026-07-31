@@ -1269,6 +1269,15 @@
       when: contentiq_align_backend_secret_to_live_routes | bool
       no_log: true
 
+    - name: "Step 6b: Validate fixed OAuth callback settings"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/validate-dynamic-oauth-secret.yml"
+      vars:
+        contentiq_oauth_backend_host: "{{ contentiq_step6b_backend_route.stdout | trim }}"
+      when:
+        - contentiq_align_backend_secret_to_live_routes | bool
+        - contentiq_align_backend_oauth_redirects | bool
+        - contentiq_oauth_use_fixed_google_box_callback | default(false) | bool
+
     # Same as rollout-wait-one.yml: without this, the Deployment keeps the 10m default progress deadline.
     - name: "Step 6b-pre: Re-assert backend dotenv override before route-alignment restart"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/patch-backend-dotenv-override.yml"

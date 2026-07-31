@@ -30,6 +30,14 @@ CALLBACK_PATHS = frozenset(
 )
 
 
+class OAuthStateError(ValueError):
+    """A safe, user-facing OAuth state validation failure."""
+
+    def __init__(self, message: str, http_status: int = 400) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+
+
 def _b64_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
@@ -70,9 +78,17 @@ def _allowed_backend(origin: str) -> bool:
     )
 
 
-def backend_from_state(state: str) -> str | None:
-    if not state or not os.getenv("OAUTH_CALLBACK_STATE_SECRET"):
-        return None
+def backend_from_state(state: str) -> str:
+    if not state:
+        raise OAuthStateError(
+            "OAuth callback state is missing. Return to ContentIQ and start the connection again."
+        )
+    if not os.getenv("OAUTH_CALLBACK_STATE_SECRET"):
+        raise OAuthStateError(
+            "OAuth callback proxy is not configured with a state secret.",
+            http_status=503,
+        )
+
     try:
         encoded_body, encoded_signature = state.split(".", 1)
         expected = hmac.new(
@@ -82,18 +98,39 @@ def backend_from_state(state: str) -> str | None:
         ).digest()
         supplied = _b64_decode(encoded_signature)
         if not hmac.compare_digest(expected, supplied):
-            return None
+            raise OAuthStateError(
+                "OAuth callback state signature is invalid. "
+                "Return to ContentIQ and start the connection again."
+            )
         data = json.loads(_b64_decode(encoded_body).decode("utf-8"))
         if not isinstance(data, dict) or data.get("v") != 1:
-            return None
-        if int(data.get("exp", 0)) < int(time.time()):
-            return None
+            raise OAuthStateError(
+                "OAuth callback state has an unsupported format. "
+                "Return to ContentIQ and start the connection again."
+            )
+        if int(data.get("exp", 0)) <= int(time.time()):
+            raise OAuthStateError(
+                "OAuth connection attempt expired. Return to ContentIQ and start the connection "
+                "again, then complete provider consent without reusing this callback URL."
+            )
         origin = _normalize_origin(data.get("backend_origin", ""))
-        if not origin or not _allowed_backend(origin):
-            return None
+        if not origin:
+            raise OAuthStateError(
+                "OAuth callback state does not contain a valid reservation backend origin."
+            )
+        if not _allowed_backend(origin):
+            raise OAuthStateError(
+                "OAuth callback reservation backend origin is not allowed.",
+                http_status=403,
+            )
         return origin
-    except (binascii.Error, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
-        return None
+    except OAuthStateError:
+        raise
+    except (binascii.Error, ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+        raise OAuthStateError(
+            "OAuth callback state is malformed. "
+            "Return to ContentIQ and start the connection again."
+        ) from exc
 
 
 class OAuthCallbackProxyHandler(BaseHTTPRequestHandler):
@@ -113,13 +150,10 @@ class OAuthCallbackProxyHandler(BaseHTTPRequestHandler):
 
         qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
         state = (qs.get("state") or [""])[0]
-        backend = backend_from_state(state)
-        if not backend:
-            self.send_error(
-                400,
-                "OAuth state did not include reservation backend origin "
-                "(expected backend_origin in base64 JSON state).",
-            )
+        try:
+            backend = backend_from_state(state)
+        except OAuthStateError as exc:
+            self.send_error(exc.http_status, str(exc))
             return
 
         target = f"{backend}{parsed.path}"

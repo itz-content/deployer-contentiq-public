@@ -111,7 +111,11 @@
       }}
     _secret_patch: >-
       {{
-        {'GOOGLE_REDIRECT_URI': _google_uri, 'BOX_REDIRECT_URI': _box_uri}
+        {
+          'GOOGLE_REDIRECT_URI': _google_uri,
+          'BOX_REDIRECT_URI': _box_uri,
+          'OAUTH_CALLBACK_BACKEND_ORIGIN': 'https://' ~ contentiq_oauth_backend_host
+        }
         | combine(
             {'MICROSOFT_REDIRECT_URI': _microsoft_uri}
             if (_use_fixed_microsoft | bool)

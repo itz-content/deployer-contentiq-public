@@ -46,6 +46,10 @@ for f in deployment.yaml service.yaml; do
   "${OC}" apply -f "${MANIFEST_DIR}/${f}" -n "${NS}"
 done
 
+echo "Restarting callback proxy to load the current script and secret …"
+"${OC}" rollout restart deployment/contentiq-oauth-callback-proxy -n "${NS}"
+"${OC}" rollout status deployment/contentiq-oauth-callback-proxy -n "${NS}" --timeout=300s
+
 echo "Applying Route (host=${ROUTE_HOST}) …"
 sed "s/host: oauth.contentiq.symplistic.ai/host: ${ROUTE_HOST}/" "${MANIFEST_DIR}/route.yaml" \
   | "${OC}" apply -f - -n "${NS}"
