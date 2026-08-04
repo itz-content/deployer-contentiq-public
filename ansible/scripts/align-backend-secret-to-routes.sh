@@ -10,6 +10,10 @@ set -euo pipefail
 
 NS="${NS:-contentiq}"
 OC="${OC:-oc}"
+# Set to an empty string only when Google/Box callbacks are registered directly
+# against each reservation backend instead of the fixed platform proxy.
+OAUTH_CALLBACK_PROXY_BASE="${OAUTH_CALLBACK_PROXY_BASE-https://oauth.contentiq.symplistic.ai}"
+OAUTH_CALLBACK_PROXY_BASE="${OAUTH_CALLBACK_PROXY_BASE%/}"
 
 FE="$("${OC}" get route contentiq-frontend -n "${NS}" -o jsonpath='{.spec.host}')"
 BE="$("${OC}" get route contentiq-backend -n "${NS}" -o jsonpath='{.spec.host}')"
@@ -25,11 +29,18 @@ SESSION_COOKIE_DOMAIN=".${SESSION_COOKIE_DOMAIN}"
 
 FRONTEND_URL="https://${FE}"
 CORS_ALLOWED_ORIGINS="${FRONTEND_URL}"
+# WXO ContentIQ tools bake this URL at upload time. Without it, INGESTION_SERVER=prod
+# defaults tools to https://backend.contentiq.symplistic.ai and on-prem chat never hits RAG.
+CONTENTIQ_TOOL_API_ENDPOINT="https://${BE}/api/external/contentiq-tool-query"
+OAUTH_REDIRECT_BASE="${OAUTH_CALLBACK_PROXY_BASE:-https://${BE}}"
 
 echo "Aligning contentiq-backend-secrets in ${NS}:"
 echo "  FRONTEND_URL=${FRONTEND_URL}"
 echo "  CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS}"
 echo "  SESSION_COOKIE_DOMAIN=${SESSION_COOKIE_DOMAIN}"
+echo "  OAUTH_CALLBACK_PROXY_BASE=${OAUTH_CALLBACK_PROXY_BASE:-<direct backend callbacks>}"
+echo "  OAUTH_CALLBACK_BACKEND_ORIGIN=https://${BE}"
+echo "  CONTENTIQ_TOOL_API_ENDPOINT=${CONTENTIQ_TOOL_API_ENDPOINT}"
 
 PATCH_JSON="$(python3 - <<PY
 import json
@@ -38,9 +49,16 @@ print(json.dumps({
         "FRONTEND_URL": "${FRONTEND_URL}",
         "CORS_ALLOWED_ORIGINS": "${CORS_ALLOWED_ORIGINS}",
         "SESSION_COOKIE_DOMAIN": "${SESSION_COOKIE_DOMAIN}",
+        "SESSION_COOKIE_SAMESITE": "None",
+        "SESSION_COOKIE_SECURE": "true",
         "MICROSOFT_REDIRECT_URI": "https://${BE}/api/connections/microsoft/auth/microsoft/callback",
-        "GOOGLE_REDIRECT_URI": "https://${BE}/api/connections/googledrive/auth/google/callback",
-        "BOX_REDIRECT_URI": "https://${BE}/api/connections/box/auth/box/callback",
+        "GOOGLE_REDIRECT_URI": "${OAUTH_REDIRECT_BASE}/api/connections/googledrive/auth/google/callback",
+        "BOX_REDIRECT_URI": "${OAUTH_REDIRECT_BASE}/api/connections/box/auth/box/callback",
+        "OAUTH_CALLBACK_PROXY_BASE": "${OAUTH_CALLBACK_PROXY_BASE}",
+        "OAUTH_CALLBACK_BACKEND_ORIGIN": "https://${BE}",
+        # OpenShift random UID cannot write under /app; avoid playground 500s on timestamp POST.
+        "THREAD_MESSAGE_TIMESTAMPS_FILE": "/tmp/.thread_message_timestamps.json",
+        "CONTENTIQ_TOOL_API_ENDPOINT": "${CONTENTIQ_TOOL_API_ENDPOINT}",
     }
 }))
 PY

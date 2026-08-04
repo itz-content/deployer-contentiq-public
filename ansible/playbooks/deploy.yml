@@ -1232,6 +1232,8 @@
           SESSION_COOKIE_SECURE: "true"
           MICROSOFT_REDIRECT_URI: "https://{{ contentiq_step6b_be }}/api/connections/microsoft/auth/microsoft/callback"
           THREAD_MESSAGE_TIMESTAMPS_FILE: "/tmp/.thread_message_timestamps.json"
+          # Bake on-prem backend into WXO ContentIQ tools (else prod SaaS URL is used).
+          CONTENTIQ_TOOL_API_ENDPOINT: "https://{{ contentiq_step6b_be }}/api/external/contentiq-tool-query"
       vars:
         contentiq_step6b_fe: "{{ contentiq_step6b_frontend_route.stdout | trim }}"
         contentiq_step6b_be: "{{ contentiq_step6b_backend_route.stdout | trim }}"

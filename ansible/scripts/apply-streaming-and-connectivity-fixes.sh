@@ -39,9 +39,8 @@ echo "=== 1) BEFORE: route timeouts ==="
 
 echo ""
 echo "=== 2) Annotate HAProxy route timeouts (${ROUTE_TIMEOUT}) ==="
-for R in contentiq-frontend contentiq-backend; do
-  "${OC}" annotate route "${R}" -n "${NS}" --overwrite "haproxy.router.openshift.io/timeout=${ROUTE_TIMEOUT}"
-done
+NS="${NS}" OC="${OC}" ROUTE_TIMEOUT="${ROUTE_TIMEOUT}" \
+  "${SCRIPT_DIR}/ensure-route-haproxy-timeouts.sh"
 echo "Expect: router picks this up within seconds (no pod restart)."
 
 echo ""
@@ -122,6 +121,51 @@ PY
   fi
 else
   echo "Skipping lakehouse secret patch (edge-gateway Service not found)."
+fi
+
+echo ""
+echo "=== 7b) Lakekeeper bootstrap (accept-terms-of-use; idempotent) ==="
+if "${OC}" get deployment lakekeeper -n "${NS}" >/dev/null 2>&1 \
+  && "${OC}" get deployment contentiq-backend -n "${NS}" >/dev/null 2>&1; then
+  BOOT_OUT="$("${OC}" exec -n "${NS}" deploy/contentiq-backend -c backend -- python3 - <<'PY'
+import json, os, urllib.error, urllib.request
+token = os.environ.get("LAKEHOUSE_SERVICE_TOKEN", "").strip()
+headers = {"Content-Type": "application/json", "Accept": "application/json"}
+if token:
+    headers["Authorization"] = f"Bearer {token}"
+with urllib.request.urlopen(urllib.request.Request("http://lakekeeper:8181/management/v1/info", headers=headers), timeout=20) as r:
+    info = json.loads(r.read().decode())
+if info.get("bootstrapped") is True:
+    print("ALREADY_BOOTSTRAPPED")
+    raise SystemExit(0)
+body = json.dumps({"accept-terms-of-use": True}).encode()
+req = urllib.request.Request("http://lakekeeper:8181/management/v1/bootstrap", data=body, headers=headers, method="POST")
+try:
+    with urllib.request.urlopen(req, timeout=30) as r:
+        print(f"BOOTSTRAPPED:{r.getcode()}")
+except urllib.error.HTTPError as e:
+    if e.code in (204, 409, 422):
+        print(f"BOOTSTRAP_OK_CONFLICT:{e.code}")
+        raise SystemExit(0)
+    print(f"BOOTSTRAP_HTTP_ERROR:{e.code}:{e.read().decode(errors='replace')[:300]}")
+    raise SystemExit(1)
+PY
+)" || true
+  echo "${BOOT_OUT}"
+  CONFIRM="$("${OC}" exec -n "${NS}" deploy/contentiq-backend -c backend -- python3 - <<'PY'
+import json, os, urllib.request
+token = os.environ.get("LAKEHOUSE_SERVICE_TOKEN", "").strip()
+headers = {"Accept": "application/json"}
+if token:
+    headers["Authorization"] = f"Bearer {token}"
+with urllib.request.urlopen(urllib.request.Request("http://lakekeeper:8181/management/v1/info", headers=headers), timeout=20) as r:
+    info = json.loads(r.read().decode())
+print(json.dumps({"bootstrapped": bool(info.get("bootstrapped"))}))
+raise SystemExit(0 if info.get("bootstrapped") is True else 1)
+PY
+)" && echo "OK: ${CONFIRM}" || echo "WARN: Lakekeeper still not bootstrapped — structured chat may soft-fail"
+else
+  echo "Skipping Lakekeeper bootstrap (lakekeeper or contentiq-backend not found)."
 fi
 
 echo ""
