@@ -17,8 +17,11 @@
 #
 # Or pass the same keys via Terraform override post_deploy_override_variables (JSON string).
 #
-# IBM Secrets Manager path (default for TechZone OCP on IBM Cloud): uses kube-system/ibm-secret
-# for IAM when IBM_CLOUD_API_KEY is unset. Override SM endpoint/UUIDs if not using playbook defaults.
+# IBM Secrets Manager (default TechZone path): Step 1b syncs backend/RAG/registry from SM.
+# API key: kube-system/ibm-secret when IBM_CLOUD_API_KEY is unset (see deploy.yml).
+# SM UUIDs / payload formats: same as playbooks/ibm-sm-deploy.vars.example.yml and tekton/.env.sm.example.
+# Symplistic operators refresh SM from templates: ./scripts/push-ibm-sm-secrets.sh
+# Verify: ./playbooks/scripts/compare-ibm-sm-to-local-templates.sh
 
 contentiq_fetch_secrets_from_ibm_sm: true
 contentiq_manage_pull_secret: false
@@ -27,13 +30,18 @@ contentiq_manage_pull_secret: false
 # contentiq_sync_oauth_redirect_uris_to_providers: auto
 
 # Google/Box: fixed platform OAuth callback (defaults also in deploy.yml).
-# One-time platform setup: oauth-callback-proxy + GCP/Box console redirect URIs on oauth.contentiq.symplistic.ai
-# One-time IBM SM (all connector creds + redirect URIs — on-prem has no local secrets templates):
-#   ./playbooks/scripts/add-platform-oauth-keys-to-ibm-sm-backend.sh --sync-cluster
-# Per deploy: playbook pulls SM (Step 1b) and patches fixed redirect URIs + live routes (Step 6b).
+# Platform creds (BOX_*, GOOGLE_*, AZURE_GRAPH_*) live in the backend SM secret.
+# Per deploy: Step 1b pulls SM; Step 6b patches fixed redirects, enables dynamic OAuth,
+# ensures OAUTH_CALLBACK_STATE_SECRET (cluster → template fallback), and sets
+# OAUTH_CALLBACK_BACKEND_ORIGIN from the reservation's live contentiq-backend Route.
 contentiq_oauth_fixed_callback_base: "https://oauth.contentiq.symplistic.ai"
 # contentiq_oauth_fixed_google_redirect_uri: ""
 # contentiq_oauth_fixed_box_redirect_uri: ""
+# contentiq_oauth_callback_state_secret: ""   # optional; else cluster secret or backend template
+# contentiq_oauth_state_ttl_seconds: "1800"
+# Optional POC: fixed Microsoft callback; register this URI once in Azure and set
+# OAUTH_CALLBACK_STATE_SECRET in the backend and callback proxy to the same value.
+# contentiq_oauth_fixed_microsoft_redirect_uri: "https://oauth.contentiq.symplistic.ai/api/connections/microsoft/auth/microsoft/callback"
 
 # Optional: skip OSB Step 9 in lab when broker secret is not configured
 # contentiq_skip_osb_provision: true

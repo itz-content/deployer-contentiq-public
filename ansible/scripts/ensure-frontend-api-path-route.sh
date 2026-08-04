@@ -47,30 +47,45 @@ spec:
   wildcardPolicy: None
 EOF
 
-echo "Waiting for route admit..."
-for _ in $(seq 1 30); do
+# Admit is not enough: HAProxy may still serve the catch-all frontend Route for a short
+# window after the path Route is Admitted. Retry the live probe until /api hits backend.
+PROBE_URL="https://${FE}/api/auth/get-credentials"
+PROBE_RETRIES="${PROBE_RETRIES:-45}"
+PROBE_DELAY_SECONDS="${PROBE_DELAY_SECONDS:-2}"
+PROBE_BODY="${TMPDIR:-/tmp}/ciq-api-path.$$.body"
+trap 'rm -f "${PROBE_BODY}"' EXIT
+
+echo "Waiting for path route to serve backend (expect 401 JSON; Admit alone is not enough)..."
+ok=0
+last_code_and_type=""
+for attempt in $(seq 1 "${PROBE_RETRIES}"); do
   admitted="$("${OC}" get route "${ROUTE_NAME}" -n "${NS}" -o jsonpath='{.status.ingress[0].conditions[?(@.type=="Admitted")].status}' 2>/dev/null || true)"
-  if [[ "${admitted}" == "True" ]]; then
+  last_code_and_type="$(curl -sk -o "${PROBE_BODY}" -w '%{http_code} %{content_type}' "${PROBE_URL}" || true)"
+  if echo "${last_code_and_type}" | grep -q '^401'; then
+    echo "  attempt ${attempt}/${PROBE_RETRIES}: ${last_code_and_type} (Admitted=${admitted:-unknown})"
+    ok=1
     break
   fi
-  sleep 2
+  body_snip="$(head -c 120 "${PROBE_BODY}" 2>/dev/null | tr '\n' ' ' || true)"
+  echo "  attempt ${attempt}/${PROBE_RETRIES}: ${last_code_and_type} (Admitted=${admitted:-unknown}) — ${body_snip}"
+  sleep "${PROBE_DELAY_SECONDS}"
 done
 
-echo "Verify same-origin /api on frontend host (expect 401 JSON, not 404 File not found):"
-CODE_AND_TYPE="$(curl -sk -o /tmp/ciq-api-path.body -w '%{http_code} %{content_type}' \
-  "https://${FE}/api/auth/get-credentials")"
-echo "  ${CODE_AND_TYPE}"
-head -c 200 /tmp/ciq-api-path.body; echo
+echo "Verify same-origin /api on frontend host:"
+echo "  ${last_code_and_type}"
+head -c 200 "${PROBE_BODY}" 2>/dev/null; echo
 
-if echo "${CODE_AND_TYPE}" | grep -q '^401'; then
+if [[ "${ok}" -eq 1 ]]; then
   echo "OK: /api is proxied to backend on the frontend host"
 else
-  BODY="$(cat /tmp/ciq-api-path.body)"
-  if echo "${BODY}" | grep -qi 'File not found'; then
-    echo "FAIL: still hitting frontend static server (path route not matching)"
+  BODY="$(cat "${PROBE_BODY}" 2>/dev/null || true)"
+  if echo "${BODY}" | grep -qiE 'File not found|Error response'; then
+    echo "FAIL: still hitting frontend static server after ${PROBE_RETRIES} probes (~$((PROBE_RETRIES * PROBE_DELAY_SECONDS))s)."
+    echo "Check: oc get route ${ROUTE_NAME} contentiq-frontend -n ${NS} -o wide"
     exit 1
   fi
-  echo "WARN: unexpected response (not 401). Check route/router if sidebar still shows User."
+  echo "FAIL: unexpected response after ${PROBE_RETRIES} probes (expected 401 JSON)."
+  exit 1
 fi
 
 echo ""

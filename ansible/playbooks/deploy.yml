@@ -234,17 +234,23 @@
     # false | true | auto — see DEPLOYMENT-CONFIG.md "OAuth redirect URI automation".
     contentiq_sync_oauth_redirect_uris_to_providers: auto
     # Google/Box: fixed platform callback (one URI in GCP + Box consoles; proxy forwards to reservation backend).
-    # Step 6b patches BOX_REDIRECT_URI, GOOGLE_REDIRECT_URI, OAUTH_CALLBACK_PROXY_BASE from this base.
+    # Step 6b patches BOX_REDIRECT_URI, GOOGLE_REDIRECT_URI, OAUTH_CALLBACK_PROXY_BASE,
+    # OAUTH_DYNAMIC_REDIRECT_ENABLED, OAUTH_STATE_TTL_SECONDS, and OAUTH_CALLBACK_STATE_SECRET
+    # (plus OAUTH_CALLBACK_BACKEND_ORIGIN from the live backend Route) so fixed-callback validation
+    # does not require manual secret edits after IBM SM sync.
     # Register once in GCP + Box: https://oauth.contentiq.symplistic.ai/api/connections/.../callback
     contentiq_oauth_fixed_callback_base: "https://oauth.contentiq.symplistic.ai"
     contentiq_oauth_fixed_google_redirect_uri: ""
     contentiq_oauth_fixed_box_redirect_uri: ""
+    # Shared with platform oauth-callback-proxy. Empty = reuse cluster secret, else backend template.
+    contentiq_oauth_callback_state_secret: ""
+    contentiq_oauth_state_ttl_seconds: "1800"
     # Optional POC: use the same fixed proxy for Microsoft instead of per-reservation registration.
     # contentiq_oauth_fixed_microsoft_redirect_uri: "https://oauth.contentiq.symplistic.ai/api/connections/microsoft/auth/microsoft/callback"
     # Local/lab only: overlay Box/Google creds from ansible/secrets/backend-secrets-template.yaml after Step 1b.
     # On-prem / TechZone (IBM SM): false — credentials and redirect URIs live in IBM SM; use
     # playbooks/scripts/add-platform-oauth-keys-to-ibm-sm-backend.sh once. Step 6b still patches
-    # BOX_REDIRECT_URI / GOOGLE_REDIRECT_URI / OAUTH_CALLBACK_PROXY_BASE from contentiq_oauth_fixed_callback_base.
+    # fixed-callback keys from contentiq_oauth_fixed_callback_base (including dynamic-oauth enablement).
     contentiq_merge_platform_oauth_from_template: false
     contentiq_platform_oauth_template_keys:
       - BOX_CLIENT_ID

@@ -4,7 +4,11 @@
 # Optional: contentiq_oauth_fixed_callback_base, contentiq_oauth_fixed_google_redirect_uri,
 #           contentiq_oauth_fixed_box_redirect_uri, contentiq_oauth_fixed_microsoft_redirect_uri
 #           (playbook vars or IBM SM via cluster secret).
-# Sets: contentiq_oauth_redirect_uris, contentiq_oauth_google_box_secret_patch
+# When fixed callback is enabled, also ensures dynamic-oauth keys on the backend secret patch
+# (OAUTH_DYNAMIC_REDIRECT_ENABLED, OAUTH_STATE_TTL_SECONDS, OAUTH_CALLBACK_STATE_SECRET) so
+# Step 6b validation does not require manual secret edits after IBM SM sync.
+# Sets: contentiq_oauth_redirect_uris, contentiq_oauth_google_box_secret_patch,
+#       contentiq_oauth_use_fixed_google_box_callback, contentiq_oauth_callback_state_secret_effective
 
 - name: "OAuth URIs: Load fixed-callback overrides from backend secret when unset"
   when:
@@ -69,6 +73,91 @@
             ) | trim
           }}
 
+# Fixed platform proxy requires a shared HMAC secret with the callback proxy. Prefer playbook
+# var, then the live cluster secret, then the backend secrets template (same value pushed to IBM SM).
+- name: "OAuth URIs: Resolve shared callback state secret for fixed flow"
+  when: (contentiq_oauth_fixed_callback_base | default('') | trim | length) > 0
+  block:
+    - name: "OAuth URIs: Read OAUTH_CALLBACK_STATE_SECRET from cluster"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - get
+          - secret
+          - contentiq-backend-secrets
+          - -n
+          - "{{ contentiq_namespace }}"
+          - -o
+          - jsonpath={.data.OAUTH_CALLBACK_STATE_SECRET}
+      register: contentiq_oauth_state_secret_cluster_cmd
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: "OAuth URIs: Decode cluster callback state secret"
+      ansible.builtin.set_fact:
+        contentiq_oauth_state_secret_from_cluster: >-
+          {{
+            (
+              (contentiq_oauth_state_secret_cluster_cmd.stdout | default('') | trim | b64decode | trim)
+              if ((contentiq_oauth_state_secret_cluster_cmd.stdout | default('') | trim | length) > 0)
+              else ''
+            )
+          }}
+      no_log: true
+
+    - name: "OAuth URIs: Load callback state secret from backend template when still unset"
+      when:
+        - (contentiq_oauth_callback_state_secret | default('') | trim | length) < 32
+        - (contentiq_oauth_state_secret_from_cluster | default('') | trim | length) < 32
+        - (contentiq_backend_secret_manifest | default('') | trim | length) > 0
+      block:
+        - name: "OAuth URIs: Stat backend secrets template"
+          ansible.builtin.stat:
+            path: "{{ contentiq_backend_secret_manifest }}"
+          register: contentiq_oauth_backend_template_stat
+
+        - name: "OAuth URIs: Parse OAUTH_CALLBACK_STATE_SECRET from template"
+          when: contentiq_oauth_backend_template_stat.stat.exists | default(false)
+          ansible.builtin.set_fact:
+            contentiq_oauth_state_secret_from_template: >-
+              {{
+                (
+                  (lookup('file', contentiq_backend_secret_manifest) | from_yaml).stringData.OAUTH_CALLBACK_STATE_SECRET
+                  | default('', true)
+                  | trim
+                )
+              }}
+          no_log: true
+
+    - name: "OAuth URIs: Select effective callback state secret"
+      ansible.builtin.set_fact:
+        contentiq_oauth_callback_state_secret_effective: >-
+          {{
+            _from_var
+            if (_from_var | length >= 32)
+            else (
+              _from_cluster
+              if (_from_cluster | length >= 32)
+              else _from_template
+            )
+          }}
+      vars:
+        _from_var: "{{ contentiq_oauth_callback_state_secret | default('') | trim }}"
+        _from_cluster: "{{ contentiq_oauth_state_secret_from_cluster | default('') | trim }}"
+        _from_template: "{{ contentiq_oauth_state_secret_from_template | default('') | trim }}"
+      no_log: true
+
+    - name: "OAuth URIs: Assert shared callback state secret is available"
+      ansible.builtin.assert:
+        that:
+          - (contentiq_oauth_callback_state_secret_effective | default('') | trim | length) >= 32
+        fail_msg: >-
+          Fixed OAuth callback requires OAUTH_CALLBACK_STATE_SECRET (at least 32 characters),
+          shared with the platform oauth-callback-proxy. Set contentiq_oauth_callback_state_secret,
+          ensure it is present in IBM SM / contentiq-backend-secrets, or include it in
+          {{ contentiq_backend_secret_manifest | default('ansible/secrets/backend-secrets-template.yaml') }}.
+
 - name: "OAuth URIs: Resolve Microsoft, Google, and Box redirect URIs"
   ansible.builtin.set_fact:
     contentiq_oauth_fixed_base_normalized: "{{ contentiq_oauth_fixed_callback_base | default('') | trim | regex_replace('/$', '') }}"
@@ -83,6 +172,8 @@
     _use_fixed: "{{ (contentiq_oauth_fixed_callback_base | default('') | trim | length) > 0 }}"
     _use_fixed_microsoft: "{{ (contentiq_oauth_fixed_microsoft_redirect_uri | default('') | trim | length) > 0 }}"
     _base: "{{ contentiq_oauth_fixed_callback_base | default('') | trim | regex_replace('/$', '') }}"
+    _ttl: "{{ contentiq_oauth_state_ttl_seconds | default('1800') | trim }}"
+    _state_secret: "{{ contentiq_oauth_callback_state_secret_effective | default('') | trim }}"
     _microsoft_uri: >-
       {{
         (contentiq_oauth_fixed_microsoft_redirect_uri | default('') | trim)
@@ -109,6 +200,17 @@
           else ('https://' ~ contentiq_oauth_backend_host ~ '/api/connections/box/auth/box/callback')
         )
       }}
+    _fixed_dynamic_patch: >-
+      {{
+        {
+          'OAUTH_CALLBACK_PROXY_BASE': _base,
+          'OAUTH_DYNAMIC_REDIRECT_ENABLED': 'true',
+          'OAUTH_STATE_TTL_SECONDS': _ttl,
+          'OAUTH_CALLBACK_STATE_SECRET': _state_secret
+        }
+        if (_use_fixed | bool)
+        else {}
+      }}
     _secret_patch: >-
       {{
         {
@@ -121,9 +223,5 @@
             if (_use_fixed_microsoft | bool)
             else {}
           )
-        | combine(
-            {'OAUTH_CALLBACK_PROXY_BASE': _base}
-            if (_use_fixed | bool)
-            else {}
-          )
+        | combine(_fixed_dynamic_patch)
       }}
