@@ -109,6 +109,38 @@
     - contentiq_verify_deploy_connectivity | bool
     - contentiq_verify_env_json_and_cors | default(true) | bool
 
+- name: "Verify: ContentIQ tool endpoint matches the live backend Route"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    expected="{{ contentiq_verify_backend_api_url }}/api/external/contentiq-tool-query"
+    secret_endpoint="$({{ contentiq_oc_binary }} get secret contentiq-backend-secrets -n {{ contentiq_namespace }} -o jsonpath='{.data.CONTENTIQ_TOOL_API_ENDPOINT}' | base64 -d)"
+    pod_endpoint="$({{ contentiq_oc_binary }} exec deployment/contentiq-backend -n {{ contentiq_namespace }} -c {{ contentiq_backend_container_name }} -- sh -c 'printf %s "${CONTENTIQ_TOOL_API_ENDPOINT-}"')"
+    test "${secret_endpoint}" = "${expected}"
+    test "${pod_endpoint}" = "${expected}"
+  args:
+    executable: /bin/bash
+  register: contentiq_step6e_tool_endpoint
+  changed_when: false
+  failed_when: false
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - contentiq_verify_env_json_and_cors | default(true) | bool
+    - contentiq_verify_tool_api_endpoint | default(true) | bool
+
+- name: "Verify: Assert ContentIQ tool endpoint"
+  ansible.builtin.assert:
+    that:
+      - contentiq_step6e_tool_endpoint.rc == 0
+    fail_msg: >-
+      CONTENTIQ_TOOL_API_ENDPOINT must be the live backend Route plus
+      /api/external/contentiq-tool-query in both contentiq-backend-secrets and the running backend pod.
+      Re-run Step 6-post route alignment. Got: {{ contentiq_step6e_tool_endpoint.stdout | default('') }}
+      {{ contentiq_step6e_tool_endpoint.stderr | default('') }}
+  when:
+    - contentiq_verify_deploy_connectivity | bool
+    - contentiq_verify_env_json_and_cors | default(true) | bool
+    - contentiq_verify_tool_api_endpoint | default(true) | bool
+
 - name: "Verify: Frontend-host /api path Route proxies to backend (Safari)"
   ansible.builtin.shell: |
     set -euo pipefail
@@ -247,6 +279,7 @@
       - "/env.json apiBaseUrl: OK"
       - "Backend CORS on /api/support/health: OK"
       - "SESSION_COOKIE_SAMESITE=None + SESSION_COOKIE_SECURE=true: OK (Safari)"
+      - "CONTENTIQ_TOOL_API_ENDPOINT matches live backend Route: OK"
       - "Frontend-host /api path Route → backend: OK (Safari same-origin /api)"
   when:
     - contentiq_verify_deploy_connectivity | bool

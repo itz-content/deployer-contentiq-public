@@ -26,6 +26,13 @@
 contentiq_fetch_secrets_from_ibm_sm: true
 contentiq_manage_pull_secret: false
 
+# WXO ContentIQ tools must call this reservation's backend, not the SaaS/default host.
+# The playbook derives the endpoint from the live contentiq-backend Route; keep both
+# route alignment and the final runtime check enabled for TechZone reservations.
+contentiq_align_backend_secret_to_live_routes: true
+contentiq_finalize_connectivity_after_deploy: true
+contentiq_verify_tool_api_endpoint: true
+
 # OAuth: auto-register each reservation's Microsoft callback in Azure when AZURE_GRAPH_* are in IBM SM.
 # contentiq_sync_oauth_redirect_uris_to_providers: auto
 

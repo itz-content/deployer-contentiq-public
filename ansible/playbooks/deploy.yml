@@ -230,6 +230,9 @@
     contentiq_align_backend_secret_to_live_routes: true
     contentiq_align_backend_oauth_redirects: true
     contentiq_step6b_wait_backend_rollout_after_align: true
+    # WXO tools are generated from the running backend environment. Keep this enabled for
+    # TechZone so the reservation Route replaces the SaaS/default placeholder before use.
+    contentiq_verify_tool_api_endpoint: true
     # After Routes exist: optionally register callback URLs in Azure via Graph (auto when AZURE_GRAPH_* in SM).
     # false | true | auto — see DEPLOYMENT-CONFIG.md "OAuth redirect URI automation".
     contentiq_sync_oauth_redirect_uris_to_providers: auto
@@ -1290,6 +1293,23 @@
       changed_when: true
       when: contentiq_align_backend_secret_to_live_routes | bool
       no_log: true
+
+    - name: "Step 6b: Set ContentIQ tool endpoint on backend Deployment"
+      ansible.builtin.command:
+        argv:
+          - "{{ contentiq_oc_binary }}"
+          - set
+          - env
+          - deployment/contentiq-backend
+          - -n
+          - "{{ contentiq_namespace }}"
+          - "CONTENTIQ_TOOL_API_ENDPOINT=https://{{ contentiq_step6b_be }}/api/external/contentiq-tool-query"
+          - --overwrite
+      register: contentiq_step6b_tool_endpoint_deployment_env
+      changed_when: true
+      when: contentiq_align_backend_secret_to_live_routes | bool
+      vars:
+        contentiq_step6b_be: "{{ contentiq_step6b_backend_route.stdout | trim }}"
 
     # Belt-and-suspenders: tiny dedicated patch so fixed-callback keys cannot be lost if the
     # large route-alignment combine ever omits them on older Ansible runners.

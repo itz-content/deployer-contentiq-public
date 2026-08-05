@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Restore FRONTEND_URL / CORS_ALLOWED_ORIGINS (and related keys) from live OpenShift Routes.
+# Also writes CONTENTIQ_TOOL_API_ENDPOINT directly to the backend Deployment so the
+# running WXO tool uploader cannot fall back to the SaaS/default placeholder.
 # Run this after a manual `oc apply -f secrets/backend-secrets-template.yaml` that left
 # __CONTENTIQ_*__ placeholders, or whenever login fails with a browser CORS error.
 #
@@ -89,6 +91,9 @@ PY
 )"
 
 "${OC}" patch secret contentiq-backend-secrets -n "${NS}" --type=merge -p "${PATCH_JSON}"
+
+"${OC}" set env deployment/contentiq-backend -n "${NS}" \
+  "CONTENTIQ_TOOL_API_ENDPOINT=${CONTENTIQ_TOOL_API_ENDPOINT}" --overwrite
 
 echo "Restarting contentiq-backend..."
 "${OC}" rollout restart deployment/contentiq-backend -n "${NS}"
