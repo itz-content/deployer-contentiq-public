@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Safari (and any client with empty API_BASE_URL) calls same-origin /api/* on the
-# frontend host. Without this route those hit Python SimpleHTTP → 404 "File not found"
-# and the sidebar stays on "User". Chrome often still works via /env.json → backend host.
+# Same-origin /api on the frontend host → contentiq-backend.
+#
+# Required when /env.json apiBaseUrl is the frontend origin (contentiq_browser_api_same_origin)
+# so login/WxO session cookies stay first-party. Also covers Safari/iOS when layout.html calls
+# /api with an empty API_BASE_URL (otherwise Python SimpleHTTP → 404 "File not found").
 #
 # Creates path-based Route: https://<frontend>/api/* → contentiq-backend Service.
-# Safe for Chrome: absolute apiBaseUrl traffic still uses the backend Route.
 #
 # Usage (after oc login):
 #   ./scripts/ensure-frontend-api-path-route.sh

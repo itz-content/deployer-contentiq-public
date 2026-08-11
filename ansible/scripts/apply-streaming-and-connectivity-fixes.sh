@@ -51,8 +51,15 @@ echo ""
 echo "=== 4) Force-render /env.json inside Running frontend pod ==="
 POD="$("${OC}" get pods -n "${NS}" -l app=contentiq-frontend --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')"
 echo "Pod: ${POD}"
+# Prefer same-origin frontend origin (session cookies); override with CONTENTIQ_BROWSER_API_SAME_ORIGIN=0.
+SAME_ORIGIN="${CONTENTIQ_BROWSER_API_SAME_ORIGIN:-1}"
+if [[ "${SAME_ORIGIN}" == "0" || "${SAME_ORIGIN}" == "false" || "${SAME_ORIGIN}" == "False" ]]; then
+  BROWSER_API_BASE="${BACKEND_ORIGIN}"
+else
+  BROWSER_API_BASE="${FRONTEND_ORIGIN}"
+fi
 "${OC}" exec -n "${NS}" "${POD}" -c frontend -- env \
-  CONTENTIQ_API_BASE_URL="${BACKEND_ORIGIN}" \
+  CONTENTIQ_API_BASE_URL="${BROWSER_API_BASE}" \
   CONTENTIQ_PLAYGROUND_STREAM_TIMEOUT_SECONDS="${PLAYGROUND_TIMEOUT}" \
   CONTENTIQ_RUNTIME_CONFIG_PATH=/config/env.json \
   python /srv/app/on_prem_packaging/render_runtime_config.py
@@ -67,10 +74,10 @@ sleep 3
 ENV_JSON="$(curl -sk "${FRONTEND_ORIGIN}/env.json")"
 echo "${ENV_JSON}"
 
-if echo "${ENV_JSON}" | grep -q "\"apiBaseUrl\".*${BACKEND_ORIGIN}"; then
+if echo "${ENV_JSON}" | grep -q "\"apiBaseUrl\".*${BROWSER_API_BASE}"; then
   echo "OK: apiBaseUrl"
 else
-  echo "WARN: apiBaseUrl mismatch — expected ${BACKEND_ORIGIN}"
+  echo "WARN: apiBaseUrl mismatch — expected ${BROWSER_API_BASE}"
 fi
 
 if echo "${ENV_JSON}" | grep -q 'playgroundStreamTimeoutSeconds'; then

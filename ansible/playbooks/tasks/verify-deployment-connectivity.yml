@@ -28,6 +28,12 @@
     contentiq_verify_backend_host: "{{ contentiq_step6e_route_hosts.results[1].stdout | trim }}"
     contentiq_verify_frontend_origin: "https://{{ contentiq_step6e_route_hosts.results[0].stdout | trim }}"
     contentiq_verify_backend_api_url: "https://{{ contentiq_step6e_route_hosts.results[1].stdout | trim }}"
+    contentiq_verify_browser_api_url: >-
+      {{
+        ('https://' ~ (contentiq_step6e_route_hosts.results[0].stdout | trim))
+        if (contentiq_browser_api_same_origin | default(true) | bool)
+        else ('https://' ~ (contentiq_step6e_route_hosts.results[1].stdout | trim))
+      }}
   when:
     - contentiq_verify_deploy_connectivity | bool
     - contentiq_verify_env_json_and_cors | default(true) | bool
@@ -44,15 +50,16 @@
     - contentiq_verify_deploy_connectivity | bool
     - contentiq_verify_env_json_and_cors | default(true) | bool
 
-- name: "Verify: Assert /env.json apiBaseUrl matches backend route"
+- name: "Verify: Assert /env.json apiBaseUrl matches browser API base"
   ansible.builtin.assert:
     that:
       - contentiq_step6e_env_json.json is mapping
       - contentiq_step6e_env_json.json.apiBaseUrl is defined
       - contentiq_step6e_env_json.json.apiBaseUrl | length > 0
-      - contentiq_step6e_env_json.json.apiBaseUrl == contentiq_verify_backend_api_url
+      - contentiq_step6e_env_json.json.apiBaseUrl == contentiq_verify_browser_api_url
     fail_msg: >-
-      /env.json apiBaseUrl must be {{ contentiq_verify_backend_api_url }}.
+      /env.json apiBaseUrl must be {{ contentiq_verify_browser_api_url }}
+      (frontend origin when contentiq_browser_api_same_origin=true; else backend Route).
       Got: {{ contentiq_step6e_env_json.content | default('') }}.
       Patch frontend-config (CONTENTIQ_API_BASE_URL) and apply frontend-runtime-config-patch.yaml.
   when:
@@ -194,7 +201,7 @@
 - name: "Verify: Warn when CONTENTIQ_API_BASE_URL missing from frontend-config"
   ansible.builtin.debug:
     msg: >-
-      WARN: frontend-config should include CONTENTIQ_API_BASE_URL={{ contentiq_verify_backend_api_url }}
+      WARN: frontend-config should include CONTENTIQ_API_BASE_URL={{ contentiq_verify_browser_api_url }}
       (operator may only set ONPREM_API_URL). Step 6c merge-patch should add it.
   when:
     - contentiq_verify_deploy_connectivity | bool
@@ -276,11 +283,11 @@
     msg:
       - "Frontend: {{ contentiq_verify_frontend_origin }}"
       - "Backend:  {{ contentiq_verify_backend_api_url }}"
-      - "/env.json apiBaseUrl: OK"
+      - "/env.json apiBaseUrl (browser): {{ contentiq_verify_browser_api_url }} OK"
       - "Backend CORS on /api/support/health: OK"
       - "SESSION_COOKIE_SAMESITE=None + SESSION_COOKIE_SECURE=true: OK (Safari)"
       - "CONTENTIQ_TOOL_API_ENDPOINT matches live backend Route: OK"
-      - "Frontend-host /api path Route → backend: OK (Safari same-origin /api)"
+      - "Frontend-host /api path Route → backend: OK (same-origin browser API)"
   when:
     - contentiq_verify_deploy_connectivity | bool
     - contentiq_verify_env_json_and_cors | default(true) | bool

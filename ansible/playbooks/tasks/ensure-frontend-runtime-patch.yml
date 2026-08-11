@@ -55,6 +55,16 @@
 - name: "Frontend patch: Set backend API URL from live route"
   ansible.builtin.set_fact:
     contentiq_frontend_patch_backend_api_url: "https://{{ contentiq_frontend_patch_be_route.stdout | trim }}"
+    contentiq_frontend_patch_frontend_origin: "https://{{ contentiq_frontend_patch_fe_route.stdout | trim }}"
+
+- name: "Frontend patch: Choose browser apiBaseUrl (same-origin frontend vs backend Route)"
+  ansible.builtin.set_fact:
+    contentiq_frontend_patch_browser_api_url: >-
+      {{
+        contentiq_frontend_patch_frontend_origin
+        if (contentiq_browser_api_same_origin | default(true) | bool)
+        else contentiq_frontend_patch_backend_api_url
+      }}
 
 - name: "Frontend patch: Wait for frontend-config ConfigMap"
   ansible.builtin.command:
@@ -86,8 +96,8 @@
         {{
           {
             'data': {
-              'CONTENTIQ_API_BASE_URL': contentiq_frontend_patch_backend_api_url,
-              'ONPREM_API_URL': contentiq_frontend_patch_backend_api_url,
+              'CONTENTIQ_API_BASE_URL': contentiq_frontend_patch_browser_api_url,
+              'ONPREM_API_URL': contentiq_frontend_patch_browser_api_url,
               'CONTENTIQ_PLAYGROUND_STREAM_TIMEOUT_SECONDS': (contentiq_frontend_playground_stream_timeout_seconds | string)
             }
           } | to_json

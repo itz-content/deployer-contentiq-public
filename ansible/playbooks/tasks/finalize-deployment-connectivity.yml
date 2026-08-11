@@ -30,13 +30,13 @@
   ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/sync-oauth-provider-redirect-uris.yml"
   when: (contentiq_sync_oauth_redirect_uris_to_providers | default('auto') | string | lower) != 'false'
 
+- name: "Finalize: Ensure frontend-host /api path Route (before same-origin apiBaseUrl)"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/ensure-frontend-api-path-route.yml"
+  when: contentiq_ensure_frontend_api_path_route | default(true) | bool
+
 - name: "Finalize: Align frontend /env.json and playground stream timeout"
   ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/align-frontend-runtime-config.yml"
   when: contentiq_align_frontend_runtime_config | bool
-
-- name: "Finalize: Ensure frontend-host /api path Route (Safari same-origin /api)"
-  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/ensure-frontend-api-path-route.yml"
-  when: contentiq_ensure_frontend_api_path_route | default(true) | bool
 
 - name: "Finalize: Re-annotate Route HAProxy timeouts (after rollouts; operator may reset Routes)"
   ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/annotate-route-timeouts.yml"
