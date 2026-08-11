@@ -43,7 +43,7 @@
       - frontend
       - --
       - env
-      - CONTENTIQ_API_BASE_URL={{ contentiq_frontend_patch_backend_api_url | default('') }}
+      - CONTENTIQ_API_BASE_URL={{ contentiq_frontend_patch_browser_api_url | default(contentiq_frontend_patch_backend_api_url) | default('') }}
       - CONTENTIQ_PLAYGROUND_STREAM_TIMEOUT_SECONDS={{ contentiq_frontend_playground_stream_timeout_seconds | string }}
       - python
       - /srv/app/on_prem_packaging/render_runtime_config.py
@@ -136,7 +136,7 @@
       - frontend
       - --
       - env
-      - CONTENTIQ_API_BASE_URL={{ contentiq_frontend_patch_backend_api_url | default('') }}
+      - CONTENTIQ_API_BASE_URL={{ contentiq_frontend_patch_browser_api_url | default(contentiq_frontend_patch_backend_api_url) | default('') }}
       - CONTENTIQ_PLAYGROUND_STREAM_TIMEOUT_SECONDS={{ contentiq_frontend_playground_stream_timeout_seconds | string }}
       - CONTENTIQ_RUNTIME_CONFIG_PATH=/config/env.json
       - python
@@ -170,16 +170,17 @@
     - contentiq_align_frontend_runtime_config | bool
     - contentiq_step6c_verify_env_json_in_pod | default(true) | bool
 
-- name: "Step 6c: Assert in-pod env.json contains backend apiBaseUrl"
+- name: "Step 6c: Assert in-pod env.json contains browser apiBaseUrl"
   ansible.builtin.assert:
     that:
       - (contentiq_step6c_env_json_pod.stdout | from_json) is mapping
       - (contentiq_step6c_env_json_pod.stdout | from_json).apiBaseUrl is defined
       - (contentiq_step6c_env_json_pod.stdout | from_json).apiBaseUrl | length > 0
-      - (contentiq_step6c_env_json_pod.stdout | from_json).apiBaseUrl == contentiq_frontend_patch_backend_api_url
+      - (contentiq_step6c_env_json_pod.stdout | from_json).apiBaseUrl == (contentiq_frontend_patch_browser_api_url | default(contentiq_frontend_patch_backend_api_url))
     fail_msg: >-
-      Frontend pod env.json is empty or apiBaseUrl does not match the backend route.
-      Expected {{ contentiq_frontend_patch_backend_api_url }}.
+      Frontend pod env.json is empty or apiBaseUrl does not match the browser API base.
+      Expected {{ contentiq_frontend_patch_browser_api_url | default(contentiq_frontend_patch_backend_api_url) }}
+      (same-origin frontend when contentiq_browser_api_same_origin=true).
       Got: {{ contentiq_step6c_env_json_pod.stdout | default('') }}.
       Check frontend-config (CONTENTIQ_API_BASE_URL) and the initContainer patch.
   when:
@@ -198,7 +199,7 @@
     contentiq_step6c_env_json.status == 200
     and contentiq_step6c_env_json.json is mapping
     and (contentiq_step6c_env_json.json.apiBaseUrl | default('') | length) > 0
-    and contentiq_step6c_env_json.json.apiBaseUrl == contentiq_frontend_patch_backend_api_url
+    and contentiq_step6c_env_json.json.apiBaseUrl == (contentiq_frontend_patch_browser_api_url | default(contentiq_frontend_patch_backend_api_url))
   retries: "{{ contentiq_step6c_env_json_verify_retries }}"
   delay: "{{ contentiq_step6c_env_json_verify_delay_seconds }}"
   when: contentiq_align_frontend_runtime_config | bool

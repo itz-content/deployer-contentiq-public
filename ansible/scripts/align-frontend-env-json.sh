@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Point browser /env.json apiBaseUrl at the live backend OpenShift Route (not operator defaults
-# like https://backend.contentiq.symplistic.ai). Run after deploy or when the UI shows CORS errors
-# against the wrong API host.
+# Point browser /env.json apiBaseUrl at the live frontend OpenShift Route (same-origin /api)
+# so login/WxO session cookies stay first-party via contentiq-frontend-api.
+# Set CONTENTIQ_BROWSER_API_SAME_ORIGIN=0 to advertise the backend Route instead (cross-origin).
 #
 # Usage (after oc login):
 #   ./scripts/align-frontend-env-json.sh
 #   NS=contentiq ./scripts/align-frontend-env-json.sh
+#   CONTENTIQ_BROWSER_API_SAME_ORIGIN=0 ./scripts/align-frontend-env-json.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,6 +15,7 @@ PATCH_FILE="${ANSIBLE_DIR}/manifests/frontend-runtime-config-patch.yaml"
 
 NS="${NS:-contentiq}"
 OC="${OC:-oc}"
+SAME_ORIGIN="${CONTENTIQ_BROWSER_API_SAME_ORIGIN:-1}"
 
 FE="$("${OC}" get route contentiq-frontend -n "${NS}" -o jsonpath='{.spec.host}')"
 BE="$("${OC}" get route contentiq-backend -n "${NS}" -o jsonpath='{.spec.host}')"
@@ -23,12 +25,25 @@ if [[ -z "${FE}" || -z "${BE}" ]]; then
   exit 1
 fi
 
-API_BASE="https://${BE}"
+BACKEND_ORIGIN="https://${BE}"
 FRONTEND_ORIGIN="https://${FE}"
+if [[ "${SAME_ORIGIN}" == "0" || "${SAME_ORIGIN}" == "false" || "${SAME_ORIGIN}" == "False" ]]; then
+  API_BASE="${BACKEND_ORIGIN}"
+  MODE="backend Route (cross-origin)"
+else
+  API_BASE="${FRONTEND_ORIGIN}"
+  MODE="frontend origin (same-origin /api)"
+fi
 
 echo "Aligning frontend runtime config in ${NS}:"
 echo "  CONTENTIQ_API_BASE_URL=${API_BASE}"
-echo "  (frontend origin ${FRONTEND_ORIGIN})"
+echo "  mode: ${MODE}"
+echo "  backend origin (tools/CORS): ${BACKEND_ORIGIN}"
+
+if [[ "${API_BASE}" == "${FRONTEND_ORIGIN}" ]]; then
+  echo "Ensuring frontend-host /api path Route before same-origin apiBaseUrl..."
+  NS="${NS}" OC="${OC}" "${SCRIPT_DIR}/ensure-frontend-api-path-route.sh"
+fi
 
 CM_PATCH="$(python3 - <<PY
 import json
@@ -76,7 +91,7 @@ echo "Verify /env.json (browser uses this for all API calls):"
 ENV_JSON="$(curl -sk "${FRONTEND_ORIGIN}/env.json")"
 echo "${ENV_JSON}"
 if echo "${ENV_JSON}" | grep -q "\"apiBaseUrl\".*${API_BASE}"; then
-  echo "OK: apiBaseUrl matches backend route"
+  echo "OK: apiBaseUrl matches ${MODE}"
 else
   echo "FAIL: apiBaseUrl still wrong — expected ${API_BASE}"
   exit 1
@@ -85,7 +100,7 @@ fi
 echo ""
 echo "Verify backend CORS (for ${FRONTEND_ORIGIN}):"
 curl -sk -D - -o /dev/null -H "Origin: ${FRONTEND_ORIGIN}" \
-  "${API_BASE}/api/support/health" | grep -iE 'HTTP/|access-control-allow-origin' || true
+  "${BACKEND_ORIGIN}/api/support/health" | grep -iE 'HTTP/|access-control-allow-origin' || true
 
 echo ""
 echo "Done. Hard-refresh the browser (Ctrl+Shift+R). Username/preferences need the API above."
